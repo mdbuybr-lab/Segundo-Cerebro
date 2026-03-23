@@ -25,6 +25,7 @@ const navGroups = [
     title: 'VIDA & SAÚDE',
     links: [
       { to: '/academia', icon: '💪', label: 'Academia', color: '#a2ff00' },
+      { to: '/nutricao', icon: '🥗', label: 'Nutrição', color: '#00e676' },
       { to: '/metas', icon: '🎯', label: 'Metas', color: '#ff6a9b' },
     ],
   },

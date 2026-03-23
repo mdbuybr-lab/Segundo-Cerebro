@@ -23,6 +23,7 @@ import Anotacoes from './pages/Anotacoes';
 import AssistenteIA from './pages/AssistenteIA';
 import Configuracoes from './pages/Configuracoes';
 import ImportarOFX from './pages/ImportarOFX';
+import Nutricao from './pages/Nutricao';
 
 function ProtectedLayout() {
   const { user, loading } = useAuth();
@@ -59,6 +60,7 @@ function ProtectedLayout() {
           <Route path="/assistente" element={<AssistenteIA />} />
           <Route path="/configuracoes" element={<Configuracoes />} />
           <Route path="/importar-ofx" element={<ImportarOFX />} />
+          <Route path="/nutricao" element={<Nutricao />} />
         </Routes>
       </main>
     </div>

@@ -1,473 +1,486 @@
-import { useState } from 'react';
+import { useState, useRef, useEffect, useMemo } from 'react';
 import { useApp } from '../context/AppContext';
+import { useAuth } from '../context/AuthContext';
+import { db } from '../firebase';
+import { doc, updateDoc, serverTimestamp } from 'firebase/firestore';
+import Groq from 'groq-sdk';
 import { Modal, EmptyState, ConfirmDialog, formatDate, getToday, Checkbox } from '../components/shared';
-import { Plus, Edit2, Trash2, Activity, Play, Calendar, CheckCircle2 } from 'lucide-react';
+import { Plus, Edit2, Trash2, Activity, Play, Calendar, CheckCircle2, Send, Loader2, Dumbbell, LineChart as LineChartIcon, BarChart3, Timer } from 'lucide-react';
+import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, Legend, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar } from 'recharts';
+
+const TABS = ['🤖 Personal IA', '📏 Métricas', '📋 Planos', '💪 Registrar Treino', '📊 Estatísticas'];
+
+const QUICK_MSGS = [
+  'Criar meu plano de treino',
+  'Treino de hoje',
+  'Como executar supino?',
+  'Sugira progressão de carga',
+  'Treino para emagrecer',
+  'Treino em casa',
+];
+
+function calcularStreak(treinosOrdenados) {
+  if (!treinosOrdenados.length) return 0;
+  let streak = 0;
+  const hoje = new Date();
+  for (let i = 0; i < 120; i++) {
+    const d = new Date(hoje); d.setDate(d.getDate() - i);
+    const key = d.toISOString().split('T')[0];
+    if (treinosOrdenados.some(t => t.data === key)) streak++;
+    else if (i > 0) break;
+  }
+  return streak;
+}
+
+function getContextoAcademia(user, metricas, planos, treinos) {
+  const ult = metricas[0] || {};
+  const treinosOrd = [...treinos].sort((a, b) => (b.data || '').localeCompare(a.data || ''));
+  const ultimo = treinosOrd[0];
+  const streak = calcularStreak(treinosOrd);
+  const planoAtivo = planos.find(p => p.ativo) || planos[0];
+
+  return `Você é Max, personal trainer virtual do app Segundo Cérebro.
+Seja motivador, técnico e focado em resultados seguros e sustentáveis.
+
+PERFIL DO USUÁRIO:
+- Nome: ${user?.displayName || 'Atleta'}
+- Peso: ${ult.peso || 'não informado'} kg
+- Altura: ${ult.altura || 'não informado'} cm
+- % Gordura: ${ult.gordura || 'não informado'}%
+- Massa Muscular: ${ult.massa || 'não informado'} kg
+- Objetivo: ${ult.objetivo || 'não informado'}
+- Nível: ${ult.nivel || 'não informado'}
+- Limitações: ${ult.limitacoes || 'nenhuma'}
+
+HISTÓRICO:
+- Total de treinos: ${treinos.length}
+- Streak atual: ${streak} dias
+- Último treino: ${ultimo ? ultimo.data + ' — ' + (ultimo.planoNome || 'livre') : 'nenhum ainda'}
+- Plano ativo: ${planoAtivo ? planoAtivo.nome : 'nenhum'}
+
+Suas capacidades: criar programas de treino, sugerir progressão, explicar exercícios, adaptar para limitações, calcular volume/intensidade, analisar histórico, motivar.
+Quando criar plano: divisão de treino, exercícios/séries/reps/carga/descanso por dia, aquecimento/alongamento, dicas de execução.
+Pergunte sobre objetivo, nível, dias disponíveis e limitações antes de criar plano.
+Responda SEMPRE em português brasileiro. Seja motivador e técnico.`;
+}
 
 export default function Academia() {
   const { state, addItem, updateItem, deleteItem } = useApp();
-  const [tab, setTab] = useState('Planos'); // Planos, Treinos, Historico
-  
-  // States (Planos)
+  const { user } = useAuth();
+  const [tab, setTab] = useState(0);
+  const apiKey = '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';
+
+  const planos = state.academia?.planos || [];
+  const treinos = state.academia?.treinos || [];
+  const metricas = state.academia?.metricas || [];
+  const treinosOrd = useMemo(() => [...treinos].sort((a, b) => (b.data || '').localeCompare(a.data || '')), [treinos]);
+  const streak = useMemo(() => calcularStreak(treinosOrd), [treinosOrd]);
+
+  // ============ TAB 0: CHAT ============
+  const [messages, setMessages] = useState(() => {
+    const saved = localStorage.getItem('sc-personal-chat');
+    return saved ? JSON.parse(saved) : [{ role: 'assistant', content: 'E aí! Sou o **Max**, seu personal trainer virtual 💪. Posso criar treinos personalizados, sugerir progressão de carga, explicar exercícios e muito mais. Bora treinar? 🔥' }];
+  });
+  const [chatInput, setChatInput] = useState('');
+  const [chatLoading, setChatLoading] = useState(false);
+  const endRef = useRef(null);
+
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+  useEffect(() => { localStorage.setItem('sc-personal-chat', JSON.stringify(messages)); }, [messages]);
+
+  const sendChat = async (text) => {
+    if (!text?.trim()) return;
+    const newMsgs = [...messages, { role: 'user', content: text.trim() }];
+    setMessages(newMsgs); setChatInput(''); setChatLoading(true);
+    try {
+      const groq = new Groq({ apiKey, dangerouslyAllowBrowser: true });
+      const systemPrompt = getContextoAcademia(user, metricas, planos, treinos);
+      const completion = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        messages: [{ role: 'system', content: systemPrompt }, ...newMsgs.slice(-20).map(m => ({ role: m.role, content: m.content }))],
+        temperature: 0.7, max_tokens: 2048,
+      });
+      setMessages(prev => [...prev, { role: 'assistant', content: completion.choices[0]?.message?.content || 'Não consegui gerar resposta.' }]);
+    } catch { setMessages(prev => [...prev, { role: 'assistant', content: '❌ Erro ao conectar com a IA.' }]); }
+    setChatLoading(false);
+  };
+
+  // ============ TAB 1: MÉTRICAS ============
+  const [metForm, setMetForm] = useState({ peso: '', altura: '', gordura: '', massa: '', cintura: '', quadril: '', peito: '', braco: '', coxa: '', objetivo: '', nivel: '', limitacoes: '', data: getToday() });
+  const [showMetForm, setShowMetForm] = useState(false);
+  const ultMetrica = metricas[0] || {};
+  const imc = metForm.peso && metForm.altura ? (Number(metForm.peso) / ((Number(metForm.altura) / 100) ** 2)).toFixed(1) : '';
+
+  const saveMetrica = async (e) => {
+    e.preventDefault();
+    if (!metForm.peso) return;
+    await addItem('metricas', { ...metForm, imc: imc || '', criadoEm: serverTimestamp() });
+    setShowMetForm(false);
+    setMetForm({ peso: '', altura: '', gordura: '', massa: '', cintura: '', quadril: '', peito: '', braco: '', coxa: '', objetivo: '', nivel: '', limitacoes: '', data: getToday() });
+  };
+
+  // Gráfico de evolução Peso
+  const pesoData = useMemo(() => [...metricas].reverse().filter(m => m.peso).map(m => ({
+    label: m.data || '', peso: Number(m.peso), gordura: Number(m.gordura) || 0, massa: Number(m.massa) || 0
+  })), [metricas]);
+
+  // ============ TAB 2: PLANOS ============
   const [isOpenPlano, setIsOpenPlano] = useState(false);
   const [editingPlanoId, setEditingPlanoId] = useState(null);
   const [planoForm, setPlanoForm] = useState({ nome: '', exercicios: [] });
   const [exercicioForm, setExercicioForm] = useState({ nome: '', series: '3', reps: '10-12', carga: '', obs: '' });
 
-  // States (Registrar Treino)
-  const [planoSelecionado, setPlanoSelecionado] = useState('');
-  const [treinoIniciado, setTreinoIniciado] = useState(null);
-  
-  // Confirms
-  const [isConfirmOpen, setIsConfirmOpen] = useState(false);
-  const [itemToDelete, setItemToDelete] = useState(null); // {id, type: 'plano'|'treino'}
-
-  const planos = state.academia?.planos || [];
-  const treinos = state.academia?.treinos || [];
-
-  // ========== PLANOS ==========
   const openPlanoModal = (plano = null) => {
-    if (plano) {
-      setEditingPlanoId(plano.id);
-      setPlanoForm(JSON.parse(JSON.stringify(plano)));
-    } else {
-      setEditingPlanoId(null);
-      setPlanoForm({ nome: '', exercicios: [] });
-    }
+    if (plano) { setEditingPlanoId(plano.id); setPlanoForm(JSON.parse(JSON.stringify(plano))); }
+    else { setEditingPlanoId(null); setPlanoForm({ nome: '', exercicios: [] }); }
     setIsOpenPlano(true);
   };
+  const addExercicio = () => { if (!exercicioForm.nome) return; setPlanoForm({ ...planoForm, exercicios: [...planoForm.exercicios, { ...exercicioForm, id: Date.now() }] }); setExercicioForm({ nome: '', series: '3', reps: '10-12', carga: '', obs: '' }); };
+  const removeExercicio = (id) => { setPlanoForm({ ...planoForm, exercicios: planoForm.exercicios.filter(e => e.id !== id) }); };
+  const savePlano = (e) => { e.preventDefault(); if (!planoForm.nome) return; if (editingPlanoId) updateItem('planos', editingPlanoId, planoForm); else addItem('planos', planoForm); setIsOpenPlano(false); };
 
-  const addExercicioNaLista = () => {
-    if (!exercicioForm.nome) return;
-    setPlanoForm({
-      ...planoForm,
-      exercicios: [...planoForm.exercicios, { ...exercicioForm, id: Date.now() }]
-    });
-    setExercicioForm({ nome: '', series: '3', reps: '10-12', carga: '', obs: '' });
-  };
+  // ============ TAB 3: REGISTRAR TREINO ============
+  const [planoSel, setPlanoSel] = useState('');
+  const [treinoAtivo, setTreinoAtivo] = useState(null);
 
-  const removeExercicioDaLista = (id) => {
-    setPlanoForm({
-      ...planoForm,
-      exercicios: planoForm.exercicios.filter(e => e.id !== id)
-    });
-  };
-
-  const savePlano = (e) => {
-    e.preventDefault();
-    if (!planoForm.nome) return;
-
-    if (editingPlanoId) {
-      updateItem('planos', editingPlanoId, planoForm);
-    } else {
-      addItem('planos', planoForm);
-    }
-    setIsOpenPlano(false);
-  };
-
-  // ========== TREINOS ==========
   const iniciarTreino = () => {
-    if (!planoSelecionado) return;
-    const planoRef = planos.find(p => String(p.id) === String(planoSelecionado));
-    if (!planoRef) return;
-
-    // Gerar objeto de estado do treino em tempo real
-    setTreinoIniciado({
-      planoId: planoRef.id,
-      planoNome: planoRef.nome,
-      data: getToday(),
-      fimDate: null,
-      observacoes: '',
-      exercicios: planoRef.exercicios.map(ex => ({
-        ...ex,
-        seriesFeitas: Array(parseInt(ex.series) || 3).fill(false),
-        cargaUsada: ex.carga || ''
-      }))
+    const pl = planos.find(p => String(p.id) === String(planoSel));
+    if (!pl) return;
+    setTreinoAtivo({
+      planoId: pl.id, planoNome: pl.nome, data: getToday(), observacoes: '',
+      exercicios: pl.exercicios.map(ex => ({ ...ex, seriesFeitas: 0, cargaReal: ex.carga || '', concluido: false }))
     });
   };
 
-  const toggleSerie = (exIndex, sIndex) => {
-    const newEx = [...treinoIniciado.exercicios];
-    newEx[exIndex].seriesFeitas[sIndex] = !newEx[exIndex].seriesFeitas[sIndex];
-    setTreinoIniciado({...treinoIniciado, exercicios: newEx});
+  const finalizarTreino = async () => {
+    if (!treinoAtivo) return;
+    await addItem('treinos', { ...treinoAtivo, finalizado: true, criadoEm: serverTimestamp() });
+    setTreinoAtivo(null);
   };
 
-  const updateCargaUsada = (exIndex, val) => {
-    const newEx = [...treinoIniciado.exercicios];
-    newEx[exIndex].cargaUsada = val;
-    setTreinoIniciado({...treinoIniciado, exercicios: newEx});
-  };
-
-  const finalizarTreino = () => {
-    const treinoFinal = {
-      ...treinoIniciado,
-      fimDate: new Date().toISOString()
-    };
-    addItem('treinos', treinoFinal);
-    setTreinoIniciado(null);
-    setTab('Historico');
-  };
-
-  // ========== APAGAR ==========
-  const confirmDelete = () => {
-    if (itemToDelete) {
-      deleteItem(itemToDelete.type === 'plano' ? 'planos' : 'treinos', itemToDelete.id);
+  // ============ TAB 4: ESTATÍSTICAS ============
+  const treinosPorSemana = useMemo(() => {
+    const hoje = new Date(); const result = [];
+    for (let i = 7; i >= 0; i--) {
+      const semStart = new Date(hoje); semStart.setDate(semStart.getDate() - (i * 7 + semStart.getDay()));
+      const semEnd = new Date(semStart); semEnd.setDate(semEnd.getDate() + 6);
+      const count = treinos.filter(t => { const d = t.data; return d >= semStart.toISOString().split('T')[0] && d <= semEnd.toISOString().split('T')[0]; }).length;
+      result.push({ label: `S${8 - i}`, treinos: count });
     }
-    setIsConfirmOpen(false);
-    setItemToDelete(null);
-  };
+    return result;
+  }, [treinos]);
 
-  // ========== RENDERIZAÇÕES ==========
+  const [isConfirmOpen, setIsConfirmOpen] = useState(false);
+  const [itemToDelete, setItemToDelete] = useState(null);
+
   return (
     <div>
-      <div className="page-header flex justify-between items-center">
-        <div>
-          <h1>💪 Academia</h1>
-          <p>Seus treinos, cargas e evolução física</p>
-        </div>
-        {tab === 'Planos' && (
-          <button className="btn btn-primary" onClick={() => openPlanoModal()}>
-            <Plus size={18} /> Criar Plano
-          </button>
-        )}
+      <style>{`
+        .acad-tabs { display: flex; gap: 4px; background: var(--surface); border-radius: 12px; padding: 4px; margin-bottom: 24px; overflow-x: auto; }
+        .acad-tab { padding: 10px 16px; border-radius: 8px; font-size: 0.82rem; font-weight: 600; cursor: pointer; background: transparent; border: none; color: var(--text-secondary); transition: all 0.2s; white-space: nowrap; }
+        .acad-tab.active { background: var(--accent); color: #fff; }
+        .acad-tab:hover:not(.active) { background: var(--surface2); }
+
+        .chat-area { display: flex; flex-direction: column; height: calc(100vh - 220px); background: var(--surface); border: 1px solid var(--border); border-radius: 16px; overflow: hidden; }
+        .chat-msgs { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+        .chat-msgs::-webkit-scrollbar { width: 4px; } .chat-msgs::-webkit-scrollbar-thumb { background: #252538; border-radius: 4px; }
+        .chat-bubble { max-width: 80%; padding: 14px 18px; border-radius: 16px; font-size: 0.9rem; line-height: 1.5; white-space: pre-wrap; }
+        .chat-bubble.user { align-self: flex-end; background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff; border-bottom-right-radius: 4px; }
+        .chat-bubble.assistant { align-self: flex-start; background: var(--surface2); border-bottom-left-radius: 4px; }
+        .chat-input-bar { display: flex; gap: 8px; padding: 16px; border-top: 1px solid var(--border); background: var(--surface); }
+        .chat-input-bar input { flex: 1; background: var(--surface2); border: 1px solid var(--border); border-radius: 12px; padding: 12px 16px; color: var(--text); font-size: 0.9rem; outline: none; }
+        .chat-input-bar input:focus { border-color: var(--accent); }
+        .chat-send { width: 44px; height: 44px; border-radius: 12px; background: linear-gradient(135deg, var(--accent), var(--accent2)); border: none; color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+        .quick-chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+        .quick-chip { padding: 8px 14px; border-radius: 20px; font-size: 0.78rem; background: var(--surface2); border: 1px solid var(--border); color: var(--text-secondary); cursor: pointer; transition: all 0.2s; }
+        .quick-chip:hover { border-color: var(--accent); color: var(--text); }
+
+        .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+        .metric-input label { font-size: 0.8rem; color: var(--text-secondary); display: block; margin-bottom: 4px; }
+        .metric-input input, .metric-input select { width: 100%; padding: 10px; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-size: 0.9rem; }
+
+        @media (max-width: 768px) {
+          .chat-area { height: calc(100vh - 280px); }
+          .chat-bubble { max-width: 92%; }
+          .metric-grid { grid-template-columns: 1fr 1fr; }
+        }
+      `}</style>
+
+      <div className="page-header mb-md">
+        <h1>💪 Academia</h1>
       </div>
 
-      <div className="tabs">
-        <button className={`tab ${tab === 'Planos' ? 'active' : ''}`} onClick={() => setTab('Planos')}>Planos de Treino</button>
-        <button className={`tab ${tab === 'Treinos' ? 'active' : ''}`} onClick={() => setTab('Treinos')}>Registrar Treino</button>
-        <button className={`tab ${tab === 'Historico' ? 'active' : ''}`} onClick={() => setTab('Historico')}>Histórico</button>
-        <button className={`tab ${tab === 'Estatísticas' ? 'active' : ''}`} onClick={() => setTab('Estatísticas')}>Estatísticas</button>
+      <div className="acad-tabs">
+        {TABS.map((t, i) => (
+          <button key={i} className={`acad-tab ${tab === i ? 'active' : ''}`} onClick={() => setTab(i)}>{t}</button>
+        ))}
       </div>
 
-      {/* PLANOS */}
-      {tab === 'Planos' && (
+      {/* TAB 0: Personal IA */}
+      {tab === 0 && (
         <>
+          <div className="quick-chips">
+            {QUICK_MSGS.map((msg, i) => <button key={i} className="quick-chip" onClick={() => sendChat(msg)}>{msg}</button>)}
+          </div>
+          <div className="chat-area">
+            <div className="chat-msgs">
+              {messages.map((m, i) => <div key={i} className={`chat-bubble ${m.role}`}>{m.content}</div>)}
+              {chatLoading && <div className="chat-bubble assistant flex items-center gap-sm"><Loader2 size={16} className="spin" /> Max está pensando...</div>}
+              <div ref={endRef} />
+            </div>
+            <form className="chat-input-bar" onSubmit={e => { e.preventDefault(); sendChat(chatInput); }}>
+              <input value={chatInput} onChange={e => setChatInput(e.target.value)} placeholder="Fale com o Max..." disabled={chatLoading} />
+              <button type="submit" className="chat-send" disabled={chatLoading || !chatInput.trim()}><Send size={18} /></button>
+            </form>
+          </div>
+          <button className="btn btn-ghost mt-sm" style={{ fontSize: '0.8rem' }} onClick={() => setMessages([{ role: 'assistant', content: 'Chat reiniciado. Bora treinar! 💪' }])}>
+            <Trash2 size={14} /> Limpar chat
+          </button>
+        </>
+      )}
+
+      {/* TAB 1: Métricas */}
+      {tab === 1 && (
+        <div>
+          {/* Resumo */}
+          {metricas.length > 0 && (
+            <div className="card mb-lg flex items-center gap-lg" style={{ flexWrap: 'wrap' }}>
+              <div><span className="text-muted" style={{ fontSize: '0.8rem' }}>Última medição</span><div className="font-mono">{ultMetrica.data || '-'}</div></div>
+              <div><span className="text-muted" style={{ fontSize: '0.8rem' }}>Peso</span><div className="font-mono" style={{ fontSize: '1.4rem', fontWeight: 700 }}>{ultMetrica.peso || '-'} kg</div></div>
+              <div><span className="text-muted" style={{ fontSize: '0.8rem' }}>Gordura</span><div className="font-mono">{ultMetrica.gordura || '-'}%</div></div>
+              <div><span className="text-muted" style={{ fontSize: '0.8rem' }}>Músculo</span><div className="font-mono">{ultMetrica.massa || '-'} kg</div></div>
+              <div><span className="text-muted" style={{ fontSize: '0.8rem' }}>IMC</span><div className="font-mono">{ultMetrica.imc || '-'}</div></div>
+              {metricas.length > 1 && (() => {
+                const diff = Number(metricas[0].peso) - Number(metricas[metricas.length - 1].peso);
+                return <div><span className="text-muted" style={{ fontSize: '0.8rem' }}>Evolução</span><div className="font-mono" style={{ color: diff <= 0 ? 'var(--green)' : 'var(--red)' }}>{diff > 0 ? '▲' : '▼'} {Math.abs(diff).toFixed(1)} kg</div></div>;
+              })()}
+            </div>
+          )}
+
+          <button className="btn btn-primary mb-lg" onClick={() => setShowMetForm(!showMetForm)}>
+            <Plus size={16} /> {showMetForm ? 'Cancelar' : 'Nova Medição'}
+          </button>
+
+          {showMetForm && (
+            <form className="card mb-lg" onSubmit={saveMetrica}>
+              <h3 className="mb-md">📏 Registrar Medição</h3>
+              <div className="metric-grid">
+                <div className="metric-input"><label>Data</label><input type="date" value={metForm.data} onChange={e => setMetForm({ ...metForm, data: e.target.value })} /></div>
+                <div className="metric-input"><label>Peso (kg)</label><input type="number" step="0.1" value={metForm.peso} onChange={e => setMetForm({ ...metForm, peso: e.target.value })} required /></div>
+                <div className="metric-input"><label>Altura (cm)</label><input type="number" value={metForm.altura} onChange={e => setMetForm({ ...metForm, altura: e.target.value })} /></div>
+                <div className="metric-input"><label>% Gordura</label><input type="number" step="0.1" value={metForm.gordura} onChange={e => setMetForm({ ...metForm, gordura: e.target.value })} /></div>
+                <div className="metric-input"><label>Massa Muscular (kg)</label><input type="number" step="0.1" value={metForm.massa} onChange={e => setMetForm({ ...metForm, massa: e.target.value })} /></div>
+                <div className="metric-input"><label>IMC (auto)</label><input type="text" value={imc} readOnly style={{ opacity: 0.6 }} /></div>
+                <div className="metric-input"><label>Cintura (cm)</label><input type="number" value={metForm.cintura} onChange={e => setMetForm({ ...metForm, cintura: e.target.value })} /></div>
+                <div className="metric-input"><label>Quadril (cm)</label><input type="number" value={metForm.quadril} onChange={e => setMetForm({ ...metForm, quadril: e.target.value })} /></div>
+                <div className="metric-input"><label>Peito (cm)</label><input type="number" value={metForm.peito} onChange={e => setMetForm({ ...metForm, peito: e.target.value })} /></div>
+                <div className="metric-input"><label>Braço D. (cm)</label><input type="number" value={metForm.braco} onChange={e => setMetForm({ ...metForm, braco: e.target.value })} /></div>
+                <div className="metric-input"><label>Coxa (cm)</label><input type="number" value={metForm.coxa} onChange={e => setMetForm({ ...metForm, coxa: e.target.value })} /></div>
+                <div className="metric-input"><label>Objetivo</label>
+                  <select value={metForm.objetivo} onChange={e => setMetForm({ ...metForm, objetivo: e.target.value })}>
+                    <option value="">Selecione...</option><option>Hipertrofia</option><option>Emagrecimento</option><option>Condicionamento</option><option>Força</option><option>Saúde geral</option>
+                  </select>
+                </div>
+                <div className="metric-input"><label>Nível</label>
+                  <select value={metForm.nivel} onChange={e => setMetForm({ ...metForm, nivel: e.target.value })}>
+                    <option value="">Selecione...</option><option>Iniciante</option><option>Intermediário</option><option>Avançado</option>
+                  </select>
+                </div>
+                <div className="metric-input"><label>Limitações</label><input type="text" value={metForm.limitacoes} onChange={e => setMetForm({ ...metForm, limitacoes: e.target.value })} placeholder="Ex: dor no joelho direito" /></div>
+              </div>
+              <button type="submit" className="btn btn-primary mt-lg">Salvar Medição</button>
+            </form>
+          )}
+
+          {/* Gráficos de Evolução */}
+          {pesoData.length > 1 && (
+            <div className="card">
+              <h3 className="mb-md">📈 Evolução Corporal</h3>
+              <ResponsiveContainer width="100%" height={250}>
+                <AreaChart data={pesoData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#252538" />
+                  <XAxis dataKey="label" tick={{ fill: '#7a7a9a', fontSize: 10 }} axisLine={false} tickLine={false} />
+                  <YAxis tick={{ fill: '#7a7a9a', fontSize: 10 }} axisLine={false} tickLine={false} />
+                  <Tooltip contentStyle={{ background: '#1e1e30', border: '1px solid #7c6aff', borderRadius: 8, color: '#fff' }} />
+                  <Legend />
+                  <Area type="monotone" dataKey="peso" name="Peso (kg)" stroke="#00e676" fill="rgba(0,230,118,0.15)" />
+                  <Area type="monotone" dataKey="gordura" name="Gordura (%)" stroke="#ff4757" fill="rgba(255,71,87,0.1)" />
+                  <Area type="monotone" dataKey="massa" name="Massa (kg)" stroke="var(--accent3)" fill="rgba(0,212,255,0.1)" />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          )}
+
+          {/* Histórico */}
+          {metricas.length > 0 && (
+            <div className="mt-lg">
+              <h3 className="mb-md text-muted">Histórico de Medições</h3>
+              <div className="table-wrapper"><table className="table"><thead><tr><th>Data</th><th>Peso</th><th>Gordura</th><th>Músculo</th><th>IMC</th></tr></thead>
+              <tbody>{metricas.map(m => <tr key={m.id}><td>{m.data}</td><td>{m.peso} kg</td><td>{m.gordura || '-'}%</td><td>{m.massa || '-'} kg</td><td>{m.imc || '-'}</td></tr>)}</tbody></table></div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* TAB 2: Planos */}
+      {tab === 2 && (
+        <div>
+          <div className="flex justify-between items-center mb-lg">
+            <h3>{planos.length} plano{planos.length !== 1 ? 's' : ''} cadastrado{planos.length !== 1 ? 's' : ''}</h3>
+            <div className="flex gap-sm">
+              <button className="btn btn-ghost" onClick={() => { setTab(0); sendChat('Criar meu plano de treino'); }}>🤖 Pedir ao Max</button>
+              <button className="btn btn-primary" onClick={() => openPlanoModal()}><Plus size={16} /> Novo plano</button>
+            </div>
+          </div>
+
           {planos.length === 0 ? (
-            <EmptyState 
-              icon={<Activity size={48} className="text-muted" />} 
-              title="Sem planos de treino" 
-              description="Crie seu primeiro plano de treino para começar a registrar cargas e séries."
-            />
+            <EmptyState icon={<Dumbbell size={48} />} message="Nenhum plano de treino. Peça ao Max ou crie manualmente!" />
           ) : (
-            <div className="card-grid">
+            <div className="flex-col gap-md">
               {planos.map(p => (
                 <div key={p.id} className="card">
-                  <div className="card-header">
+                  <div className="flex justify-between items-center mb-sm">
                     <h3>{p.nome}</h3>
-                    <div className="flex gap-sm">
+                    <div className="flex gap-xs">
                       <button className="btn-icon" onClick={() => openPlanoModal(p)}><Edit2 size={16} /></button>
-                      <button className="btn-icon" onClick={() => { setItemToDelete({id: p.id, type: 'plano'}); setIsConfirmOpen(true); }}><Trash2 size={16} /></button>
+                      <button className="btn-icon text-red" onClick={() => { setItemToDelete({ id: p.id, type: 'plano' }); setIsConfirmOpen(true); }}><Trash2 size={16} /></button>
                     </div>
                   </div>
-                  <div className="text-muted mb-md">{p.exercicios.length} exercícios cadastrados</div>
-                  
-                  <div style={{ maxHeight: '150px', overflowY: 'auto' }}>
-                    {p.exercicios.map((ex, i) => (
-                      <div key={ex.id || i} className="flex justify-between items-center mb-sm" style={{ padding: '8px', background: 'var(--surface2)', borderRadius: '4px' }}>
-                        <span style={{ fontSize: '0.85rem', fontWeight: 600 }}>{ex.nome}</span>
-                        <span className="text-mono text-muted" style={{ fontSize: '0.75rem' }}>
-                          {ex.series}x{ex.reps} | {ex.carga || '-'}kg
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-
-                  <button 
-                    className="btn btn-primary w-100 mt-md" 
-                    style={{ width: '100%' }}
-                    onClick={() => { setPlanoSelecionado(p.id); setTab('Treinos'); }}
-                  >
-                    Iniciar Treino
-                  </button>
+                  <p className="text-muted">{p.exercicios?.length || 0} exercícios</p>
+                  {p.exercicios?.map((ex, i) => (
+                    <div key={i} className="flex items-center gap-sm mt-xs" style={{ fontSize: '0.85rem', borderBottom: '1px solid var(--border)', paddingBottom: 6 }}>
+                      <Dumbbell size={14} className="text-accent" />
+                      <span style={{ flex: 1 }}>{ex.nome}</span>
+                      <span className="font-mono text-muted">{ex.series}x{ex.reps}</span>
+                      {ex.carga && <span className="font-mono text-accent3">{ex.carga}kg</span>}
+                    </div>
+                  ))}
                 </div>
               ))}
             </div>
           )}
-        </>
+
+          {isOpenPlano && (
+            <Modal isOpen={isOpenPlano} onClose={() => setIsOpenPlano(false)} title={editingPlanoId ? 'Editar Plano' : 'Novo Plano'}>
+              <form onSubmit={savePlano}>
+                <input className="input mb-md" placeholder="Nome do plano" value={planoForm.nome} onChange={e => setPlanoForm({ ...planoForm, nome: e.target.value })} required />
+                <h4 className="mb-sm">Exercícios ({planoForm.exercicios.length})</h4>
+                {planoForm.exercicios.map((ex, i) => (
+                  <div key={i} className="flex items-center gap-xs mb-xs" style={{ fontSize: '0.85rem' }}>
+                    <span style={{ flex: 1 }}>{ex.nome}</span>
+                    <span className="text-muted">{ex.series}x{ex.reps}</span>
+                    <button type="button" className="btn-icon text-red" onClick={() => removeExercicio(ex.id)}><Trash2 size={14} /></button>
+                  </div>
+                ))}
+                <div className="flex gap-xs mt-sm mb-md" style={{ flexWrap: 'wrap' }}>
+                  <input className="input" style={{ flex: 2 }} placeholder="Nome do exercício" value={exercicioForm.nome} onChange={e => setExercicioForm({ ...exercicioForm, nome: e.target.value })} />
+                  <input className="input" style={{ width: 60 }} placeholder="Séries" value={exercicioForm.series} onChange={e => setExercicioForm({ ...exercicioForm, series: e.target.value })} />
+                  <input className="input" style={{ width: 70 }} placeholder="Reps" value={exercicioForm.reps} onChange={e => setExercicioForm({ ...exercicioForm, reps: e.target.value })} />
+                  <input className="input" style={{ width: 60 }} placeholder="Carga" value={exercicioForm.carga} onChange={e => setExercicioForm({ ...exercicioForm, carga: e.target.value })} />
+                  <button type="button" className="btn btn-ghost" onClick={addExercicio}><Plus size={16} /></button>
+                </div>
+                <button type="submit" className="btn btn-primary w-100">Salvar</button>
+              </form>
+            </Modal>
+          )}
+        </div>
       )}
 
-      {/* REGISTRAR TREINO */}
-      {tab === 'Treinos' && (
-        <div className="card" style={{ maxWidth: 800, margin: '0 auto' }}>
-          {!treinoIniciado ? (
-            <div className="text-center p-md py-lg" style={{ padding: '40px 0' }}>
-              <Activity size={64} className="text-accent mb-md" style={{ margin: '0 auto' }} />
-              <h2>Hora do Show</h2>
-              <p className="text-muted mb-lg" style={{ maxWidth: 400, margin: '8px auto 24px' }}>
-                Selecione um plano de treino para começar a gravar suas séries e evoluções de carga em tempo real.
-              </p>
-              
-              <div className="flex gap-md" style={{ justifyContent: 'center' }}>
-                <select 
-                  className="form-group"
-                  value={planoSelecionado}
-                  onChange={e => setPlanoSelecionado(e.target.value)}
-                  style={{ width: 250, padding: '10px 14px', borderRadius: 'var(--radius-sm)', background: 'var(--surface2)', border: '1px solid var(--border)' }}
-                >
-                  <option value="">Selecione um Plano...</option>
-                  {planos.map(p => <option key={p.id} value={p.id}>{p.nome}</option>)}
-                </select>
-                <button className="btn btn-primary" disabled={!planoSelecionado} onClick={iniciarTreino}>
-                  <Play size={18} fill="currentColor" /> INICIAR
-                </button>
-              </div>
+      {/* TAB 3: Registrar Treino */}
+      {tab === 3 && (
+        <div>
+          {!treinoAtivo ? (
+            <div className="card" style={{ textAlign: 'center', padding: '48px 24px' }}>
+              <Play size={48} className="text-accent" style={{ marginBottom: 16 }} />
+              <h3>Iniciar Treino</h3>
+              <p className="text-muted mt-sm mb-lg">Selecione um plano para começar</p>
+              <select className="input mb-md" value={planoSel} onChange={e => setPlanoSel(e.target.value)} style={{ maxWidth: 300, margin: '0 auto' }}>
+                <option value="">Escolha um plano...</option>
+                {planos.map(p => <option key={p.id} value={p.id}>{p.nome}</option>)}
+              </select>
+              <br />
+              <button className="btn btn-primary mt-md" onClick={iniciarTreino} disabled={!planoSel}><Play size={16} /> Começar</button>
             </div>
           ) : (
             <div>
               <div className="flex justify-between items-center mb-lg">
-                <div>
-                  <h2 className="text-accent flex items-center gap-sm">
-                    <Activity size={24} /> Treino em Progresso
-                  </h2>
-                  <p className="text-muted">{treinoIniciado.planoNome} • {formatDate(treinoIniciado.data)}</p>
+                <h3>🏋️ {treinoAtivo.planoNome}</h3>
+                <button className="btn btn-primary" onClick={finalizarTreino}><CheckCircle2 size={16} /> Finalizar</button>
+              </div>
+              {treinoAtivo.exercicios.map((ex, i) => (
+                <div key={i} className="card mb-sm">
+                  <div className="flex justify-between items-center">
+                    <div className="flex items-center gap-sm">
+                      <Checkbox checked={ex.concluido} onChange={() => {
+                        const updated = { ...treinoAtivo };
+                        updated.exercicios[i].concluido = !ex.concluido;
+                        setTreinoAtivo({ ...updated });
+                      }} />
+                      <span style={{ textDecoration: ex.concluido ? 'line-through' : 'none', opacity: ex.concluido ? 0.5 : 1 }}>{ex.nome}</span>
+                    </div>
+                    <span className="font-mono text-muted">{ex.series}x{ex.reps}</span>
+                  </div>
+                  <div className="flex gap-sm mt-sm">
+                    <input className="input" style={{ width: 80 }} placeholder="Carga" value={ex.cargaReal} onChange={e => {
+                      const upd = { ...treinoAtivo };
+                      upd.exercicios[i].cargaReal = e.target.value;
+                      setTreinoAtivo({ ...upd });
+                    }} />
+                    <span className="text-muted flex items-center" style={{ fontSize: '0.8rem' }}>kg</span>
+                  </div>
                 </div>
-                <button className="btn btn-ghost btn-sm text-red" onClick={() => setTreinoIniciado(null)}>
-                  Abortar
-                </button>
-              </div>
-
-              <div className="flex-col gap-lg overflow-y-auto" style={{ maxHeight: '60vh', paddingRight: '8px' }}>
-                {treinoIniciado.exercicios.map((ex, i) => (
-                  <div key={i} className="card p-0" style={{ overflow: 'hidden' }}>
-                    <div style={{ background: 'var(--surface2)', padding: '12px 16px', borderBottom: '1px solid var(--border)' }}>
-                      <div style={{ fontWeight: 700, fontSize: '1.1rem' }}>{ex.nome}</div>
-                      <div className="text-muted font-mono" style={{ fontSize: '0.8rem' }}>Meta: {ex.series}séries de {ex.reps} recs • Carga base: {ex.carga || '-'}kg</div>
-                    </div>
-                    
-                    <div className="p-md" style={{ padding: '16px' }}>
-                      <div className="flex gap-md mb-md wrap">
-                        {ex.seriesFeitas.map((feita, sIndex) => (
-                          <div 
-                            key={sIndex}
-                            onClick={() => toggleSerie(i, sIndex)}
-                            style={{ 
-                              width: 48, height: 48, 
-                              borderRadius: '8px', 
-                              border: feita ? '2px solid var(--green)' : '2px dashed var(--border)',
-                              background: feita ? 'var(--green-glow)' : 'transparent',
-                              display: 'flex', alignItems: 'center', justifyContent: 'center',
-                              cursor: 'pointer',
-                              fontWeight: 700,
-                              color: feita ? 'var(--green)' : 'var(--text-secondary)',
-                              transition: 'all 0.15s'
-                            }}
-                          >
-                            {sIndex + 1}
-                          </div>
-                        ))}
-                      </div>
-
-                      <div className="flex gap-sm items-center">
-                        <label className="text-muted text-mono" style={{ fontSize: '0.8rem' }}>Carga Usada (kg):</label>
-                        <input 
-                          type="text" 
-                          value={ex.cargaUsada}
-                          onChange={(e) => updateCargaUsada(i, e.target.value)}
-                          style={{ width: '80px', background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: '4px', padding: '6px', color: 'var(--text)' }}
-                        />
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-              <div className="form-group mt-lg">
-                <label>Observações do Treino</label>
-                <textarea 
-                  value={treinoIniciado.observacoes}
-                  onChange={e => setTreinoIniciado({...treinoIniciado, observacoes: e.target.value})}
-                  placeholder="Ex: Senti dor no ombro, estava sem energia..."
-                  style={{ minHeight: '60px' }}
-                />
-              </div>
-
-              <button className="btn btn-primary w-100 mt-md" style={{ width: '100%', padding: '16px', fontSize: '1.1rem' }} onClick={finalizarTreino}>
-                <CheckCircle2 size={20} /> FINALIZAR TREINO
-              </button>
+              ))}
+              <textarea className="input mt-md" placeholder="Observações do treino..." value={treinoAtivo.observacoes} onChange={e => setTreinoAtivo({ ...treinoAtivo, observacoes: e.target.value })} rows={3} style={{ width: '100%', resize: 'vertical' }} />
             </div>
           )}
         </div>
       )}
 
-      {/* HISTÓRICO */}
-      {tab === 'Historico' && (
-        <>
-          {treinos.length === 0 ? (
-            <EmptyState 
-              icon={<Calendar size={48} className="text-muted" />} 
-              title="Ainda não há treinos" 
-              description="Quando você finalizar um treino, ele aparecerá aqui."
-            />
-          ) : (
-            <div className="flex-col gap-md">
-              {treinos.sort((a,b) => new Date(b.data) - new Date(a.data)).map(t => {
-                const totalSeries = t.exercicios.reduce((acc, curr) => acc + curr.seriesFeitas.length, 0);
-                const seriesCompletas = t.exercicios.reduce((acc, curr) => acc + curr.seriesFeitas.filter(v=>v).length, 0);
-                const perc = totalSeries > 0 ? Math.round((seriesCompletas / totalSeries) * 100) : 0;
-                
-                return (
-                  <div key={t.id} className="card" style={{ display: 'flex', flexDirection: 'column' }}>
-                    <div className="flex justify-between items-start mb-md">
-                      <div>
-                        <h3>{t.planoNome}</h3>
-                        <div className="text-muted flex items-center gap-sm mt-sm text-mono">
-                          <Calendar size={14} /> {formatDate(t.data)}
-                        </div>
-                      </div>
-                      <button className="btn-icon" onClick={() => { setItemToDelete({id: t.id, type: 'treino'}); setIsConfirmOpen(true); }}>
-                        <Trash2 size={16} />
-                      </button>
-                    </div>
+      {/* TAB 4: Estatísticas */}
+      {tab === 4 && (
+        <div>
+          <div className="flex gap-md mb-lg" style={{ flexWrap: 'wrap' }}>
+            <div className="card" style={{ flex: 1, minWidth: 150, textAlign: 'center' }}>
+              <div style={{ fontSize: '2rem', fontWeight: 800, fontFamily: 'var(--font-heading)' }}>{treinos.length}</div>
+              <div className="text-muted">Total de treinos</div>
+            </div>
+            <div className="card" style={{ flex: 1, minWidth: 150, textAlign: 'center' }}>
+              <div style={{ fontSize: '2rem', fontWeight: 800, fontFamily: 'var(--font-heading)', color: 'var(--accent)' }}>🔥 {streak}</div>
+              <div className="text-muted">Streak atual</div>
+            </div>
+            <div className="card" style={{ flex: 1, minWidth: 150, textAlign: 'center' }}>
+              <div style={{ fontSize: '2rem', fontWeight: 800, fontFamily: 'var(--font-heading)', color: 'var(--green)' }}>{treinosOrd[0]?.data || '-'}</div>
+              <div className="text-muted">Último treino</div>
+            </div>
+          </div>
 
-                    <div className="progress-bar mb-sm">
-                      <div className="progress-bar-fill green" style={{ width: `${perc}%` }}></div>
-                    </div>
-                    <div className="text-right text-muted text-mono mb-md" style={{ fontSize: '0.75rem' }}>
-                      Conclusão: {perc}%
-                    </div>
+          <div className="card mb-lg">
+            <h3 className="mb-md">📊 Treinos por Semana (últimas 8 semanas)</h3>
+            <ResponsiveContainer width="100%" height={200}>
+              <BarChart data={treinosPorSemana} margin={{ top: 5, right: 10, left: -20, bottom: 5 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#252538" vertical={false} />
+                <XAxis dataKey="label" tick={{ fill: '#7a7a9a', fontSize: 11 }} axisLine={false} tickLine={false} />
+                <YAxis allowDecimals={false} tick={{ fill: '#7a7a9a', fontSize: 11 }} axisLine={false} tickLine={false} />
+                <Tooltip contentStyle={{ background: '#1e1e30', border: '1px solid #7c6aff', borderRadius: 8, color: '#fff' }} />
+                <Bar dataKey="treinos" name="Treinos" fill="var(--accent)" radius={[4, 4, 0, 0]} barSize={20} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
 
-                    <div className="flex gap-sm wrap">
-                      {t.exercicios.map((ex, i) => {
-                        const completas = ex.seriesFeitas.filter(v=>v).length;
-                        return (
-                          <span key={i} className="badge badge-muted" style={{ padding: '6px 10px' }}>
-                            {ex.nome}: <span className={completas === ex.seriesFeitas.length ? 'text-green' : 'text-yellow'}> {completas}/{ex.seriesFeitas.length}</span> s • {ex.cargaUsada || 0}kg
-                          </span>
-                        );
-                      })}
-                    </div>
-
-                    {t.observacoes && (
-                      <div className="mt-md pt-sm" style={{ borderTop: '1px solid var(--border)', fontSize: '0.85rem' }}>
-                        <strong className="text-muted">Obs:</strong> {t.observacoes}
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
+          {treinos.length > 0 && (
+            <div className="mt-lg">
+              <h3 className="mb-md text-muted">Últimos 10 treinos</h3>
+              <div className="table-wrapper"><table className="table"><thead><tr><th>Data</th><th>Plano</th><th>Exercícios</th></tr></thead>
+              <tbody>{treinosOrd.slice(0, 10).map(t => <tr key={t.id}><td>{t.data}</td><td>{t.planoNome || '-'}</td><td>{t.exercicios?.length || 0}</td></tr>)}</tbody></table></div>
             </div>
           )}
-        </>
-      )}
-
-      {/* ESTATÍSTICAS */}
-      {tab === 'Estatísticas' && (
-        <div className="card-grid">
-          <div className="summary-card">
-            <div className="summary-label">TOTAL DE TREINOS</div>
-            <div className="summary-value text-accent">{treinos.length}</div>
-          </div>
-
-          <div className="summary-card">
-            <div className="summary-label">SÉRIES COMPLETADAS</div>
-            <div className="summary-value text-green">
-              {treinos.reduce((acc, t) => acc + t.exercicios.reduce((acc2, curr) => acc2 + curr.seriesFeitas.filter(v=>v).length, 0), 0)}
-            </div>
-          </div>
-
-          <div className="summary-card">
-            <div className="summary-label">ÚLTIMO TREINO</div>
-            <div className="summary-value text-mono" style={{ fontSize: '1.2rem' }}>
-              {treinos.length > 0 ? formatDate([...treinos].sort((a,b) => new Date(b.data) - new Date(a.data))[0].data) : 'Nenhum'}
-            </div>
-          </div>
         </div>
       )}
 
-      {/* PLANO MODAL */}
-      <Modal isOpen={isOpenPlano} onClose={() => setIsOpenPlano(false)} title={editingPlanoId ? 'Editar Plano' : 'Novo Plano'} large>
-        <form onSubmit={savePlano}>
-          <div className="form-group mb-lg">
-            <label>Nome do Plano</label>
-            <input 
-              type="text" 
-              required 
-              value={planoForm.nome} 
-              onChange={e => setPlanoForm({...planoForm, nome: e.target.value})} 
-              placeholder="Ex: Treino A - Peito e Tríceps"
-            />
-          </div>
-
-          <div style={{ border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: '16px', marginBottom: '24px', background: 'var(--surface2)' }}>
-            <h4 style={{ marginBottom: '16px', fontSize: '0.9rem', color: 'var(--text-secondary)' }}>Adicionar Exercício</h4>
-            <div className="form-row">
-              <div className="form-group" style={{ flex: '2 1 150px' }}>
-                <input 
-                  type="text" placeholder="Nome (Ex: Supino Reto)" 
-                  value={exercicioForm.nome} onChange={e => setExercicioForm({...exercicioForm, nome: e.target.value})}
-                />
-              </div>
-              <div className="form-group" style={{ flex: '1 1 80px' }}>
-                <input 
-                  type="number" placeholder="Séries" 
-                  value={exercicioForm.series} onChange={e => setExercicioForm({...exercicioForm, series: e.target.value})}
-                />
-              </div>
-              <div className="form-group" style={{ flex: '1 1 80px' }}>
-                <input 
-                  type="text" placeholder="Reps (Ex: 10-12)" 
-                  value={exercicioForm.reps} onChange={e => setExercicioForm({...exercicioForm, reps: e.target.value})}
-                />
-              </div>
-              <div className="form-group" style={{ flex: '1 1 80px' }}>
-                <input 
-                  type="number" placeholder="Carga Base (kg)" 
-                  value={exercicioForm.carga} onChange={e => setExercicioForm({...exercicioForm, carga: e.target.value})}
-                />
-              </div>
-              <div className="form-group flex items-end">
-                <button type="button" className="btn btn-ghost w-100" style={{ height: '42px', width: '100%' }} onClick={addExercicioNaLista}>
-                  <Plus size={16} /> Adicionar
-                </button>
-              </div>
-            </div>
-          </div>
-
-          <div className="table-container">
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>Exercício</th>
-                  <th>Séries</th>
-                  <th>Repetições</th>
-                  <th>Carga</th>
-                  <th style={{ width: 50 }}></th>
-                </tr>
-              </thead>
-              <tbody>
-                {planoForm.exercicios.map((ex, i) => (
-                  <tr key={ex.id || i}>
-                    <td style={{ fontWeight: 600 }}>{ex.nome}</td>
-                    <td className="text-mono">{ex.series}</td>
-                    <td className="text-mono">{ex.reps}</td>
-                    <td className="text-mono">{ex.carga ? ex.carga+'kg' : '-'}</td>
-                    <td>
-                      <button type="button" className="btn-icon" onClick={() => removeExercicioDaLista(ex.id)}>
-                        <Trash2 size={16} />
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-                {planoForm.exercicios.length === 0 && (
-                  <tr><td colSpan="5" className="text-center text-muted" style={{ padding: '24px 0' }}>Nenhum exercício adicionado.</td></tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-          
-          <div className="form-actions mt-lg" style={{ justifyContent: 'flex-end', marginTop: '24px' }}>
-            <button type="button" className="btn btn-ghost" onClick={() => setIsOpenPlano(false)}>Cancelar</button>
-            <button type="submit" className="btn btn-primary" disabled={planoForm.exercicios.length === 0}>Salvar Plano</button>
-          </div>
-        </form>
-      </Modal>
-
-      <ConfirmDialog 
-        isOpen={isConfirmOpen}
-        title="Excluir Registro"
-        message="Tem certeza que apagar este registro? Esta ação é irreversível."
-        onConfirm={confirmDelete}
-        onCancel={() => setIsConfirmOpen(false)}
-      />
+      <ConfirmDialog isOpen={isConfirmOpen} onClose={() => setIsConfirmOpen(false)} onConfirm={() => {
+        if (itemToDelete) deleteItem(itemToDelete.type === 'plano' ? 'planos' : 'treinos', itemToDelete.id);
+        setIsConfirmOpen(false);
+      }} message="Tem certeza que deseja deletar este item?" />
     </div>
   );
 }

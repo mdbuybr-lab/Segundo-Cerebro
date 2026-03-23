@@ -9,7 +9,7 @@ import {
   CheckSquare, ListTodo, Square, Check,
   TrendingUp, Calendar as CalendarIcon, FolderKanban, Plus, AlertTriangle, Upload
 } from 'lucide-react';
-import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts';
+import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, PieChart, Pie, Cell, BarChart, Bar } from 'recharts';
 
 const formatCurrency = (v) => (v || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
 const getToday = () => new Date().toISOString().split('T')[0];
@@ -122,12 +122,7 @@ export default function Dashboard() {
   const anotacoes = state.anotacoes || [];
 
   // === CARD 1: Patrimônio ===
-  const patrimonioTotal = contas.reduce((sum, c) => {
-    const saldo = parseFloat(c.saldoInicial || c.saldo || 0);
-    const he = parseFloat(c.historicoEntradas || 0);
-    const hs = parseFloat(c.historicoSaidas || 0);
-    return sum + saldo + he - hs;
-  }, 0);
+  const patrimonioTotal = contas.reduce((sum, c) => sum + (Number(c.saldo) || 0), 0);
 
   const entradasMes = entradas.filter(e => e.data?.startsWith(mesAtual)).reduce((s, e) => s + (parseFloat(e.valor) || 0), 0);
   const saidasMes = saidas.filter(s => s.data?.startsWith(mesAtual)).reduce((s, e) => s + (parseFloat(e.valor) || 0), 0);
@@ -187,6 +182,45 @@ export default function Dashboard() {
       });
     } catch (e) { console.error('Erro ao concluir tarefa:', e); }
   };
+
+  // === FINANCE ANALYSIS ===
+  const CAT_COLORS = { 'Alimentação': '#ff6b6b', 'Transporte': '#4ecdc4', 'Moradia': '#45b7d1', 'Saúde': '#96ceb4', 'Lazer': '#ffeaa7', 'Educação': '#a29bfe', 'Assinaturas': '#fd79a8', 'Outros': '#636e72', 'Compras': '#e17055' };
+
+  const gastosPorCategoria = useMemo(() => {
+    const agrupado = {};
+    saidas.filter(s => s.data?.startsWith(mesAtual)).forEach(s => {
+      const cat = s.cat || 'Outros';
+      agrupado[cat] = (agrupado[cat] || 0) + (Number(s.valor) || 0);
+    });
+    return Object.entries(agrupado).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value);
+  }, [saidas, mesAtual]);
+
+  const totalGastosMes = gastosPorCategoria.reduce((s, c) => s + c.value, 0);
+
+  const top5Gastos = useMemo(() => {
+    return saidas.filter(s => s.data?.startsWith(mesAtual))
+      .sort((a, b) => Number(b.valor) - Number(a.valor))
+      .slice(0, 5)
+      .map(s => ({ name: (s.desc || 'Sem descrição').slice(0, 22), value: Number(s.valor) || 0 }));
+  }, [saidas, mesAtual]);
+
+  const comparativo6m = useMemo(() => {
+    const hoje = new Date();
+    return Array.from({ length: 6 }, (_, i) => {
+      const d = new Date(hoje); d.setMonth(d.getMonth() - (5 - i));
+      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      const label = d.toLocaleDateString('pt-BR', { month: 'short', year: '2-digit' });
+      const ent = entradas.filter(e => e.data?.startsWith(key)).reduce((s, e) => s + (Number(e.valor) || 0), 0);
+      const sai = saidas.filter(s => s.data?.startsWith(key)).reduce((s, e) => s + (Number(e.valor) || 0), 0);
+      return { label, entradas: ent, saidas: sai };
+    });
+  }, [entradas, saidas]);
+
+  const maiorGastoMes = saidas.filter(s => s.data?.startsWith(mesAtual)).sort((a, b) => Number(b.valor) - Number(a.valor))[0];
+  const catTop = gastosPorCategoria[0];
+  const melhorMes = comparativo6m.reduce((best, m) => (m.entradas - m.saidas) > (best.entradas - best.saidas) ? m : best, comparativo6m[0] || { label: '-', entradas: 0, saidas: 0 });
+  const diasNoMes = new Date().getDate();
+  const mediaDiariaGastos = diasNoMes > 0 ? saidasMes / diasNoMes : 0;
 
   return (
     <div className="dashboard-neural" style={{ paddingBottom: '40px' }}>
@@ -468,6 +502,106 @@ export default function Dashboard() {
           </div>
         </div>
       </div>
+
+      {/* ROW 2.5: Finance Analysis */}
+      {(gastosPorCategoria.length > 0 || top5Gastos.length > 0) && (
+        <div className="mb-lg">
+          <h3 className="text-muted uppercase mb-md font-mono" style={{ fontSize: '0.85rem', letterSpacing: '1px' }}>📊 Análise Financeira do Mês</h3>
+          <div className="dash-grid-2">
+            {/* Pie Chart - Gastos por Categoria */}
+            <div className="panel">
+              <div className="panel-header"><h2 className="panel-title">Gastos por Categoria</h2></div>
+              {gastosPorCategoria.length > 0 ? (
+                <div className="flex items-center" style={{ gap: 24, flexWrap: 'wrap' }}>
+                  <div style={{ width: 200, height: 200 }}>
+                    <ResponsiveContainer width="100%" height="100%">
+                      <PieChart>
+                        <Pie data={gastosPorCategoria} cx="50%" cy="50%" innerRadius={45} outerRadius={80} paddingAngle={3} dataKey="value">
+                          {gastosPorCategoria.map((entry, i) => <Cell key={i} fill={CAT_COLORS[entry.name] || '#636e72'} />)}
+                        </Pie>
+                        <Tooltip formatter={(v) => formatCurrency(v)} contentStyle={{ background: '#1e1e30', border: '1px solid #7c6aff', borderRadius: 8, color: '#fff' }} />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <div className="flex-col gap-xs" style={{ flex: 1 }}>
+                    {gastosPorCategoria.slice(0, 6).map((c, i) => (
+                      <div key={i} className="flex items-center gap-sm" style={{ fontSize: '0.82rem' }}>
+                        <div style={{ width: 10, height: 10, borderRadius: 3, background: CAT_COLORS[c.name] || '#636e72', flexShrink: 0 }} />
+                        <span style={{ flex: 1 }}>{c.name}</span>
+                        <span className="font-mono" style={{ color: 'var(--text-secondary)' }}>{totalGastosMes > 0 ? Math.round(c.value / totalGastosMes * 100) : 0}%</span>
+                        <span className="font-mono">{formatCurrency(c.value)}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : <div className="empty-msg">📊 Sem gastos este mês</div>}
+            </div>
+
+            {/* Bar Chart - Top 5 Maiores Gastos */}
+            <div className="panel">
+              <div className="panel-header"><h2 className="panel-title">Top 5 Maiores Gastos</h2></div>
+              {top5Gastos.length > 0 ? (
+                <ResponsiveContainer width="100%" height={200}>
+                  <BarChart data={top5Gastos} layout="vertical" margin={{ left: 10, right: 20, top: 5, bottom: 5 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#252538" horizontal={false} />
+                    <XAxis type="number" tick={{ fill: '#7a7a9a', fontSize: 11 }} axisLine={false} tickLine={false} tickFormatter={v => `R$${v >= 1000 ? (v/1000).toFixed(1)+'k' : v}`} />
+                    <YAxis type="category" dataKey="name" tick={{ fill: '#bbb', fontSize: 11 }} width={100} axisLine={false} tickLine={false} />
+                    <Tooltip formatter={(v) => formatCurrency(v)} contentStyle={{ background: '#1e1e30', border: '1px solid #7c6aff', borderRadius: 8, color: '#fff' }} />
+                    <Bar dataKey="value" fill="url(#barGrad)" radius={[0, 6, 6, 0]} barSize={18}>
+                      <defs><linearGradient id="barGrad" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stopColor="var(--accent)" /><stop offset="100%" stopColor="var(--accent2)" /></linearGradient></defs>
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              ) : <div className="empty-msg">📊 Sem dados</div>}
+            </div>
+          </div>
+
+          {/* Comparativo 6 meses + Resumo */}
+          <div className="dash-grid-2 mt-md">
+            <div className="panel">
+              <div className="panel-header"><h2 className="panel-title">Comparativo Últimos 6 Meses</h2></div>
+              <ResponsiveContainer width="100%" height={200}>
+                <BarChart data={comparativo6m} margin={{ top: 5, right: 10, left: -20, bottom: 5 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#252538" vertical={false} />
+                  <XAxis dataKey="label" tick={{ fill: '#7a7a9a', fontSize: 11 }} axisLine={false} tickLine={false} />
+                  <YAxis tick={{ fill: '#7a7a9a', fontSize: 11 }} axisLine={false} tickLine={false} tickFormatter={v => `R$${v >= 1000 ? (v/1000).toFixed(0)+'k' : v}`} />
+                  <Tooltip formatter={(v) => formatCurrency(v)} contentStyle={{ background: '#1e1e30', border: '1px solid #7c6aff', borderRadius: 8, color: '#fff' }} />
+                  <Legend />
+                  <Bar dataKey="entradas" name="Entradas" fill="#00e676" radius={[4, 4, 0, 0]} barSize={16} />
+                  <Bar dataKey="saidas" name="Saídas" fill="#ff4757" radius={[4, 4, 0, 0]} barSize={16} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+
+            {/* Card Resumo Financeiro */}
+            <div className="panel flex-col gap-md">
+              <h2 className="panel-title">Resumo do Mês</h2>
+              <div className="flex-col gap-md" style={{ fontSize: '0.88rem' }}>
+                <div className="flex items-center gap-sm">
+                  <span style={{ fontSize: '1.3rem' }}>💰</span>
+                  <span className="text-muted">Maior gasto:</span>
+                  <span className="font-mono" style={{ flex: 1, textAlign: 'right' }}>{maiorGastoMes ? `${(maiorGastoMes.desc || '').slice(0, 20)} — ${formatCurrency(Number(maiorGastoMes.valor))}` : 'Nenhum'}</span>
+                </div>
+                <div className="flex items-center gap-sm">
+                  <span style={{ fontSize: '1.3rem' }}>📦</span>
+                  <span className="text-muted">Categoria top:</span>
+                  <span className="font-mono" style={{ flex: 1, textAlign: 'right' }}>{catTop ? `${catTop.name} — ${formatCurrency(catTop.value)}` : 'Nenhuma'}</span>
+                </div>
+                <div className="flex items-center gap-sm">
+                  <span style={{ fontSize: '1.3rem' }}>📈</span>
+                  <span className="text-muted">Melhor mês (6m):</span>
+                  <span className="font-mono" style={{ flex: 1, textAlign: 'right', color: 'var(--green)' }}>{melhorMes ? `${melhorMes.label} — saldo ${formatCurrency(melhorMes.entradas - melhorMes.saidas)}` : '-'}</span>
+                </div>
+                <div className="flex items-center gap-sm">
+                  <span style={{ fontSize: '1.3rem' }}>⚡</span>
+                  <span className="text-muted">Média diária gastos:</span>
+                  <span className="font-mono" style={{ flex: 1, textAlign: 'right', color: 'var(--red)' }}>{formatCurrency(mediaDiariaGastos)}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ROW 3: Tasks + Projects */}
       <div className="dash-grid-50">

@@ -12,12 +12,13 @@ const defaultState = {
   saidas: [],
   programacoes: [],
   dividas: [],
-  academia: { planos: [], treinos: [] },
+  academia: { planos: [], treinos: [], metricas: [] },
   metas: [],
   tarefas: [],
   projetos: [],
   agenda: [],
   anotacoes: [],
+  nutricao: { plano: null, refeicoes: [], hidratacao: [] },
 };
 
 export function AppProvider({ children }) {
@@ -67,6 +68,35 @@ export function AppProvider({ children }) {
       setState(s => ({ ...s, academia: { ...s.academia, treinos: data } }));
     }));
 
+    // Academia Métricas
+    const qMetricas = query(collection(db, `users/${user.uid}/academia_metricas`), orderBy('criadoEm', 'desc'));
+    unsubscribes.push(onSnapshot(qMetricas, (snapshot) => {
+      const data = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+      setState(s => ({ ...s, academia: { ...s.academia, metricas: data } }));
+    }));
+
+    // Nutrição Refeições
+    const qRefeicoes = query(collection(db, `users/${user.uid}/nutricao_refeicoes`), orderBy('criadoEm', 'desc'));
+    unsubscribes.push(onSnapshot(qRefeicoes, (snapshot) => {
+      const data = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+      setState(s => ({ ...s, nutricao: { ...s.nutricao, refeicoes: data } }));
+    }));
+
+    // Nutrição Hidratação
+    const qHidratacao = query(collection(db, `users/${user.uid}/nutricao_hidratacao`), orderBy('criadoEm', 'desc'));
+    unsubscribes.push(onSnapshot(qHidratacao, (snapshot) => {
+      const data = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+      setState(s => ({ ...s, nutricao: { ...s.nutricao, hidratacao: data } }));
+    }));
+
+    // Nutrição Plano (documento único)
+    const planoRef = doc(db, `users/${user.uid}/nutricao_plano`, 'atual');
+    unsubscribes.push(onSnapshot(planoRef, (docSnap) => {
+      if (docSnap.exists()) {
+        setState(s => ({ ...s, nutricao: { ...s.nutricao, plano: { id: docSnap.id, ...docSnap.data() } } }));
+      }
+    }));
+
     return () => {
       unsubscribes.forEach(unsub => unsub());
     };
@@ -75,6 +105,9 @@ export function AppProvider({ children }) {
   const getFirestoreCol = (collectionName) => {
     if (collectionName === 'planos') return 'academia_planos';
     if (collectionName === 'treinos') return 'academia_treinos';
+    if (collectionName === 'metricas') return 'academia_metricas';
+    if (collectionName === 'refeicoes') return 'nutricao_refeicoes';
+    if (collectionName === 'hidratacao') return 'nutricao_hidratacao';
     return collectionName;
   };
 
