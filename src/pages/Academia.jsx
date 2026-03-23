@@ -3,10 +3,10 @@ import { useApp } from '../context/AppContext';
 import { useAuth } from '../context/AuthContext';
 import { db } from '../firebase';
 import { serverTimestamp } from 'firebase/firestore';
-import { callClaude, extractPlan } from '../utils/claudeApi';
+import Groq from 'groq-sdk';
 import ReactMarkdown from 'react-markdown';
-import { Modal, EmptyState, ConfirmDialog, formatDate, getToday, Checkbox } from '../components/shared';
-import { Plus, Edit2, Trash2, Activity, Play, CheckCircle2, Send, Loader2, Dumbbell, Save } from 'lucide-react';
+import { Modal, EmptyState, formatDate, getToday } from '../components/shared';
+import { Plus, Edit2, Trash2, Play, CheckCircle2, Send, Loader2, Dumbbell, Activity } from 'lucide-react';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, Legend } from 'recharts';
 
 const TABS = ['🤖 Personal IA', '📏 Métricas', '📋 Planos', '💪 Registrar Treino', '📊 Estatísticas'];
@@ -76,27 +76,34 @@ Quando criar plano: divisão de treino, exercícios/séries/reps/carga/descanso 
 Pergunte sobre objetivo, nível, dias disponíveis e limitações antes de criar plano.
 Responda SEMPRE em português brasileiro. Seja motivador e técnico. Use Markdown.
 
-INSTRUÇÃO ESPECIAL — CRIAÇÃO DE PLANOS DE TREINO:
-Quando o usuário pedir para criar um plano de treino, SEMPRE inclua no FINAL da mensagem um bloco JSON entre as tags <PLANO_TREINO> e </PLANO_TREINO>:
-<PLANO_TREINO>
+REGRA OBRIGATÓRIA: Quando o usuário pedir para criar um plano de treino completo, você DEVE incluir no final da sua resposta um bloco JSON entre as tags <SALVAR_PLANO_TREINO> e </SALVAR_PLANO_TREINO> com esta estrutura exata:
+
+<SALVAR_PLANO_TREINO>
 {
   "nome": "Nome do Plano",
   "objetivo": "Hipertrofia/Emagrecimento/etc",
   "nivel": "Iniciante/Intermediário/Avançado",
   "diasPorSemana": 3,
-  "exercicios": [
-    { "nome": "Supino reto", "series": "3", "reps": "8-12", "carga": "", "obs": "Foco na contração" },
-    { "nome": "Crucifixo", "series": "3", "reps": "10-15", "carga": "", "obs": "" }
+  "dias": [
+    {
+      "nome": "Treino A — Peito e Tríceps",
+      "exercicios": [
+        { "nome": "Supino Reto", "series": 3, "repeticoes": "8-12", "carga": "Moderada", "descanso": "60s", "observacoes": "" }
+      ]
+    }
   ]
 }
-</PLANO_TREINO>`;
+</SALVAR_PLANO_TREINO>
+
+Inclua TODOS os dias de treino e TODOS os exercícios no JSON.
+NÃO inclua esse bloco se o usuário não está pedindo para criar um plano completo.`;
 }
 
 export default function Academia() {
   const { state, addItem, updateItem, deleteItem } = useApp();
   const { user } = useAuth();
   const [tab, setTab] = useState(0);
-  const apiKey = state.config?.claudeApiKey || '';
+  const apiKey = state.config?.groqApiKey || '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';
 
   const planos = state.academia?.planos || [];
   const treinos = state.academia?.treinos || [];
@@ -111,7 +118,6 @@ export default function Academia() {
   });
   const [chatInput, setChatInput] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
-  const [pendingPlan, setPendingPlan] = useState(null);
   const endRef = useRef(null);
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
@@ -119,36 +125,61 @@ export default function Academia() {
 
   const sendChat = async (text) => {
     if (!text?.trim()) return;
-    if (!apiKey) {
-      setMessages(prev => [...prev, { role: 'user', content: text.trim() }, { role: 'assistant', content: '❌ **API Key não configurada.** Vá em ⚙️ Configurações e adicione sua API Key da Anthropic.' }]);
-      setChatInput('');
-      return;
-    }
     const newMsgs = [...messages, { role: 'user', content: text.trim() }];
     setMessages(newMsgs); setChatInput(''); setChatLoading(true);
     try {
+      const groq = new Groq({ apiKey, dangerouslyAllowBrowser: true });
       const systemPrompt = getContextoAcademia(user, metricas, planos, treinos);
-      const chatHistory = newMsgs.slice(-20).map(m => ({ role: m.role, content: m.content }));
-      const responseText = await callClaude(systemPrompt, chatHistory, apiKey);
+      const completion = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        messages: [{ role: 'system', content: systemPrompt }, ...newMsgs.slice(-20).map(m => ({ role: m.role, content: m.content }))],
+        temperature: 0.7, max_tokens: 4096,
+      });
+      const responseText = completion.choices[0]?.message?.content || 'Sem resposta.';
 
-      const { cleanText, planData } = extractPlan(responseText, 'PLANO_TREINO');
-      if (planData) setPendingPlan(planData);
-      setMessages(prev => [...prev, { role: 'assistant', content: cleanText }]);
+      // Auto-save plan if detected
+      const match = responseText.match(/<SALVAR_PLANO_TREINO>([\s\S]*?)<\/SALVAR_PLANO_TREINO>/);
+      let cleanText = responseText;
+      let saved = false;
+
+      if (match) {
+        try {
+          const planoData = JSON.parse(match[1].trim());
+          // Flatten all dias' exercicios into the top-level exercicios array for the Planos tab
+          const exerciciosFlat = (planoData.dias || []).flatMap((dia, dIdx) =>
+            (dia.exercicios || []).map((ex, eIdx) => ({
+              id: Date.now() + dIdx * 100 + eIdx,
+              nome: `[${dia.nome}] ${ex.nome}`,
+              series: String(ex.series || 3),
+              reps: ex.repeticoes || '10-12',
+              carga: ex.carga || '',
+              obs: ex.observacoes || ex.descanso || '',
+            }))
+          );
+          await addItem('planos', {
+            nome: planoData.nome || 'Plano criado pelo Max',
+            objetivo: planoData.objetivo || '',
+            nivel: planoData.nivel || '',
+            diasPorSemana: planoData.diasPorSemana || 0,
+            dias: planoData.dias || [],
+            exercicios: exerciciosFlat,
+            criadoPorIA: true,
+            ativo: false,
+          });
+          saved = true;
+        } catch (e) { console.error('Erro ao salvar plano de treino:', e); }
+        cleanText = responseText.replace(/<SALVAR_PLANO_TREINO>[\s\S]*?<\/SALVAR_PLANO_TREINO>/, '').trim();
+      }
+
+      setMessages(prev => {
+        const updated = [...prev, { role: 'assistant', content: cleanText }];
+        if (saved) updated.push({ role: 'sistema', content: '✅ Plano de treino salvo automaticamente! Acesse **Academia → Planos** para ver e ativar.' });
+        return updated;
+      });
     } catch (err) {
       setMessages(prev => [...prev, { role: 'assistant', content: `❌ Erro: ${err.message}` }]);
     }
     setChatLoading(false);
-  };
-
-  const savePlanFromAI = async () => {
-    if (!pendingPlan) return;
-    try {
-      await addItem('planos', { ...pendingPlan, criadoPorIA: true });
-      setMessages(prev => [...prev, { role: 'assistant', content: '✅ **Plano salvo com sucesso!** Acesse a aba "📋 Planos" para visualizar.' }]);
-      setPendingPlan(null);
-    } catch (e) {
-      setMessages(prev => [...prev, { role: 'assistant', content: '❌ Erro ao salvar plano: ' + e.message }]);
-    }
   };
 
   // ============ TAB 1: MÉTRICAS ============
@@ -174,6 +205,7 @@ export default function Academia() {
   const [editingPlanoId, setEditingPlanoId] = useState(null);
   const [planoForm, setPlanoForm] = useState({ nome: '', exercicios: [] });
   const [exercicioForm, setExercicioForm] = useState({ nome: '', series: '3', reps: '10-12', carga: '', obs: '' });
+  const [expandedPlano, setExpandedPlano] = useState(null);
 
   const openPlanoModal = (plano = null) => {
     if (plano) { setEditingPlanoId(plano.id); setPlanoForm(JSON.parse(JSON.stringify(plano))); }
@@ -193,7 +225,7 @@ export default function Academia() {
     if (!pl) return;
     setTreinoAtivo({
       planoId: pl.id, planoNome: pl.nome, data: getToday(), observacoes: '',
-      exercicios: pl.exercicios.map(ex => ({ ...ex, seriesFeitas: 0, cargaReal: ex.carga || '', concluido: false }))
+      exercicios: (pl.exercicios || []).map(ex => ({ ...ex, seriesFeitas: 0, cargaReal: ex.carga || '', concluido: false }))
     });
   };
 
@@ -215,9 +247,6 @@ export default function Academia() {
     return result;
   }, [treinos]);
 
-  const [isConfirmOpen, setIsConfirmOpen] = useState(false);
-  const [itemToDelete, setItemToDelete] = useState(null);
-
   return (
     <div>
       <style>{`
@@ -225,7 +254,6 @@ export default function Academia() {
         .acad-tab { padding: 10px 16px; border-radius: 8px; font-size: 0.82rem; font-weight: 600; cursor: pointer; background: transparent; border: none; color: var(--text-secondary); transition: all 0.2s; white-space: nowrap; }
         .acad-tab.active { background: #a2ff00; color: #000; }
         .acad-tab:hover:not(.active) { background: var(--surface2); }
-
         .chat-area { display: flex; flex-direction: column; height: calc(100vh - 220px); background: var(--surface); border: 1px solid var(--border); border-radius: 16px; overflow: hidden; }
         .chat-msgs { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
         .chat-msgs::-webkit-scrollbar { width: 4px; } .chat-msgs::-webkit-scrollbar-thumb { background: #252538; border-radius: 4px; }
@@ -239,38 +267,27 @@ export default function Academia() {
         .quick-chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
         .quick-chip { padding: 8px 14px; border-radius: 20px; font-size: 0.78rem; background: var(--surface2); border: 1px solid var(--border); color: var(--text-secondary); cursor: pointer; transition: all 0.2s; }
         .quick-chip:hover { border-color: #a2ff00; color: var(--text); }
-
-        .save-plan-card { background: rgba(162,255,0,0.08); border: 1px solid #a2ff00; border-radius: 12px; padding: 16px; margin: 12px 0; display: flex; align-items: center; gap: 12px; align-self: flex-start; max-width: 80%; }
-        .save-plan-btn { padding: 8px 20px; border-radius: 8px; background: #a2ff00; color: #000; border: none; cursor: pointer; font-weight: 700; font-size: 0.85rem; display: flex; align-items: center; gap: 6px; }
-
+        .sys-msg { background: rgba(0,230,118,0.08); border: 1px solid rgba(0,230,118,0.2); border-radius: 10px; padding: 10px 16px; font-size: 0.82rem; color: #00e676; text-align: center; margin: 8px 0; align-self: center; max-width: 85%; }
         .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
         .metric-input label { font-size: 0.8rem; color: var(--text-secondary); display: block; margin-bottom: 4px; }
         .metric-input input, .metric-input select { width: 100%; padding: 10px; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-size: 0.9rem; }
-
-        .no-key-banner { padding: 16px; background: rgba(255,106,155,0.1); border: 1px solid var(--accent2); border-radius: 12px; margin-bottom: 16px; font-size: 0.85rem; }
-
+        .dia-card { background: var(--surface2); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 8px; }
+        .dia-card h4 { margin-bottom: 8px; color: #a2ff00; }
+        .dia-ex { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; font-size: 0.85rem; border-bottom: 1px solid rgba(255,255,255,0.03); }
         @media (max-width: 768px) {
           .chat-area { height: calc(100vh - 280px); }
-          .chat-bubble, .save-plan-card { max-width: 92%; }
+          .chat-bubble { max-width: 92%; }
           .metric-grid { grid-template-columns: 1fr 1fr; }
         }
       `}</style>
 
       <div className="page-header mb-md">
         <h1>💪 Academia</h1>
-        <p className="text-muted">Powered by Claude — Max, seu personal trainer virtual</p>
+        <p className="text-muted">Max, seu personal trainer virtual</p>
       </div>
 
-      {!apiKey && (
-        <div className="no-key-banner">
-          ⚠️ <strong>API Key não configurada.</strong> Vá em ⚙️ Configurações e adicione sua API Key da Anthropic (Claude).
-        </div>
-      )}
-
       <div className="acad-tabs">
-        {TABS.map((t, i) => (
-          <button key={i} className={`acad-tab ${tab === i ? 'active' : ''}`} onClick={() => setTab(i)}>{t}</button>
-        ))}
+        {TABS.map((t, i) => <button key={i} className={`acad-tab ${tab === i ? 'active' : ''}`} onClick={() => setTab(i)}>{t}</button>)}
       </div>
 
       {/* TAB 0: Personal IA */}
@@ -282,18 +299,14 @@ export default function Academia() {
           <div className="chat-area">
             <div className="chat-msgs">
               {messages.map((m, i) => (
-                <div key={i} className={`chat-bubble ${m.role}`}>
-                  {m.role === 'assistant' ? (
-                    <ReactMarkdown components={MD_COMPONENTS}>{m.content}</ReactMarkdown>
-                  ) : m.content}
-                </div>
+                m.role === 'sistema' ? (
+                  <div key={i} className="sys-msg"><ReactMarkdown components={MD_COMPONENTS}>{m.content}</ReactMarkdown></div>
+                ) : (
+                  <div key={i} className={`chat-bubble ${m.role}`}>
+                    {m.role === 'assistant' ? <ReactMarkdown components={MD_COMPONENTS}>{m.content}</ReactMarkdown> : m.content}
+                  </div>
+                )
               ))}
-              {pendingPlan && (
-                <div className="save-plan-card">
-                  <span>💪 Max criou um plano de treino para você!</span>
-                  <button className="save-plan-btn" onClick={savePlanFromAI}><Save size={16} /> Salvar Plano</button>
-                </div>
-              )}
               {chatLoading && <div className="chat-bubble assistant flex items-center gap-sm"><Loader2 size={16} className="spin" /> Max está pensando...</div>}
               <div ref={endRef} />
             </div>
@@ -302,7 +315,7 @@ export default function Academia() {
               <button type="submit" className="chat-send" disabled={chatLoading || !chatInput.trim()}><Send size={18} /></button>
             </form>
           </div>
-          <button className="btn btn-ghost mt-sm" style={{ fontSize: '0.8rem' }} onClick={() => { setMessages([{ role: 'assistant', content: 'Chat reiniciado. Bora treinar! 💪' }]); setPendingPlan(null); }}>
+          <button className="btn btn-ghost mt-sm" style={{ fontSize: '0.8rem' }} onClick={() => setMessages([{ role: 'assistant', content: 'Chat reiniciado. Bora treinar! 💪' }])}>
             <Trash2 size={14} /> Limpar chat
           </button>
         </>
@@ -318,10 +331,6 @@ export default function Academia() {
               <div><span className="text-muted" style={{ fontSize: '0.8rem' }}>Gordura</span><div className="font-mono">{ultMetrica.gordura || '-'}%</div></div>
               <div><span className="text-muted" style={{ fontSize: '0.8rem' }}>Músculo</span><div className="font-mono">{ultMetrica.massa || '-'} kg</div></div>
               <div><span className="text-muted" style={{ fontSize: '0.8rem' }}>IMC</span><div className="font-mono">{ultMetrica.imc || '-'}</div></div>
-              {metricas.length > 1 && (() => {
-                const diff = Number(metricas[0].peso) - Number(metricas[metricas.length - 1].peso);
-                return <div><span className="text-muted" style={{ fontSize: '0.8rem' }}>Evolução</span><div className="font-mono" style={{ color: diff <= 0 ? 'var(--green)' : 'var(--red)' }}>{diff > 0 ? '▲' : '▼'} {Math.abs(diff).toFixed(1)} kg</div></div>;
-              })()}
             </div>
           )}
 
@@ -334,16 +343,13 @@ export default function Academia() {
               <h3 className="mb-md">📏 Registrar Medição</h3>
               <div className="metric-grid">
                 <div className="metric-input"><label>Data</label><input type="date" value={metForm.data} onChange={e => setMetForm({ ...metForm, data: e.target.value })} /></div>
-                <div className="metric-input"><label>Peso (kg)</label><input type="number" step="0.1" value={metForm.peso} onChange={e => setMetForm({ ...metForm, peso: e.target.value })} required /></div>
+                <div className="metric-input"><label>Peso (kg) *</label><input type="number" step="0.1" value={metForm.peso} onChange={e => setMetForm({ ...metForm, peso: e.target.value })} required /></div>
                 <div className="metric-input"><label>Altura (cm)</label><input type="number" value={metForm.altura} onChange={e => setMetForm({ ...metForm, altura: e.target.value })} /></div>
                 <div className="metric-input"><label>% Gordura</label><input type="number" step="0.1" value={metForm.gordura} onChange={e => setMetForm({ ...metForm, gordura: e.target.value })} /></div>
                 <div className="metric-input"><label>Massa Muscular (kg)</label><input type="number" step="0.1" value={metForm.massa} onChange={e => setMetForm({ ...metForm, massa: e.target.value })} /></div>
                 <div className="metric-input"><label>IMC (auto)</label><input type="text" value={imc} readOnly style={{ opacity: 0.6 }} /></div>
                 <div className="metric-input"><label>Cintura (cm)</label><input type="number" value={metForm.cintura} onChange={e => setMetForm({ ...metForm, cintura: e.target.value })} /></div>
                 <div className="metric-input"><label>Quadril (cm)</label><input type="number" value={metForm.quadril} onChange={e => setMetForm({ ...metForm, quadril: e.target.value })} /></div>
-                <div className="metric-input"><label>Peito (cm)</label><input type="number" value={metForm.peito} onChange={e => setMetForm({ ...metForm, peito: e.target.value })} /></div>
-                <div className="metric-input"><label>Braço D. (cm)</label><input type="number" value={metForm.braco} onChange={e => setMetForm({ ...metForm, braco: e.target.value })} /></div>
-                <div className="metric-input"><label>Coxa (cm)</label><input type="number" value={metForm.coxa} onChange={e => setMetForm({ ...metForm, coxa: e.target.value })} /></div>
                 <div className="metric-input"><label>Objetivo</label>
                   <select value={metForm.objetivo} onChange={e => setMetForm({ ...metForm, objetivo: e.target.value })}>
                     <option value="">Selecione...</option><option>Hipertrofia</option><option>Emagrecimento</option><option>Condicionamento</option><option>Força</option><option>Saúde geral</option>
@@ -354,7 +360,7 @@ export default function Academia() {
                     <option value="">Selecione...</option><option>Iniciante</option><option>Intermediário</option><option>Avançado</option>
                   </select>
                 </div>
-                <div className="metric-input"><label>Limitações</label><input type="text" value={metForm.limitacoes} onChange={e => setMetForm({ ...metForm, limitacoes: e.target.value })} placeholder="Ex: dor no joelho direito" /></div>
+                <div className="metric-input"><label>Limitações</label><input type="text" value={metForm.limitacoes} onChange={e => setMetForm({ ...metForm, limitacoes: e.target.value })} placeholder="Ex: dor no joelho" /></div>
               </div>
               <button type="submit" className="btn btn-primary mt-lg">Salvar Medição</button>
             </form>
@@ -392,7 +398,7 @@ export default function Academia() {
       {tab === 2 && (
         <div>
           <div className="flex justify-between items-center mb-lg">
-            <h3>{planos.length} plano{planos.length !== 1 ? 's' : ''} cadastrado{planos.length !== 1 ? 's' : ''}</h3>
+            <h3>{planos.length} plano{planos.length !== 1 ? 's' : ''}</h3>
             <div className="flex gap-sm">
               <button className="btn btn-ghost" onClick={() => { setTab(0); sendChat('Criar meu plano de treino'); }}>🤖 Pedir ao Max</button>
               <button className="btn btn-primary" onClick={() => openPlanoModal()}><Plus size={16} /> Novo plano</button>
@@ -400,7 +406,7 @@ export default function Academia() {
           </div>
 
           {planos.length === 0 ? (
-            <EmptyState icon={<Dumbbell size={48} />} message="Nenhum plano de treino. Peça ao Max ou crie manualmente!" />
+            <EmptyState icon={<Dumbbell size={48} />} message="Nenhum plano. Peça ao Max ou crie manualmente!" />
           ) : (
             <div className="flex-col gap-md">
               {planos.map(p => (
@@ -408,23 +414,44 @@ export default function Academia() {
                   <div className="flex justify-between items-center mb-sm">
                     <div>
                       <h3>{p.nome}</h3>
-                      {p.criadoPorIA && <span className="badge badge-accent ml-sm" style={{ fontSize: '0.7rem' }}>🤖 Criado por IA</span>}
+                      {p.criadoPorIA && <span className="badge badge-accent ml-sm" style={{ fontSize: '0.7rem' }}>Criado pela IA ✨</span>}
                     </div>
                     <div className="flex gap-xs">
+                      <button className="btn btn-ghost" style={{ fontSize: '0.75rem' }} onClick={() => setExpandedPlano(expandedPlano === p.id ? null : p.id)}>
+                        {expandedPlano === p.id ? 'Fechar' : 'Ver exercícios'}
+                      </button>
                       <button className="btn-icon" onClick={() => openPlanoModal(p)}><Edit2 size={16} /></button>
-                      <button className="btn-icon text-red" onClick={() => { setItemToDelete({ id: p.id, type: 'plano' }); setIsConfirmOpen(true); }}><Trash2 size={16} /></button>
+                      <button className="btn-icon text-red" onClick={() => deleteItem('planos', p.id)}><Trash2 size={16} /></button>
                     </div>
                   </div>
-                  {p.objetivo && <p className="text-muted mb-sm" style={{ fontSize: '0.82rem' }}>🎯 {p.objetivo} {p.nivel ? `• ${p.nivel}` : ''}</p>}
-                  <p className="text-muted">{p.exercicios?.length || 0} exercícios</p>
-                  {p.exercicios?.map((ex, i) => (
-                    <div key={i} className="flex items-center gap-sm mt-xs" style={{ fontSize: '0.85rem', borderBottom: '1px solid var(--border)', paddingBottom: 6 }}>
-                      <Dumbbell size={14} className="text-accent" />
-                      <span style={{ flex: 1 }}>{ex.nome}</span>
-                      <span className="font-mono text-muted">{ex.series}x{ex.reps}</span>
-                      {ex.carga && <span className="font-mono text-accent3">{ex.carga}kg</span>}
-                    </div>
-                  ))}
+                  {p.objetivo && <p className="text-muted mb-sm" style={{ fontSize: '0.82rem' }}>🎯 {p.objetivo} {p.nivel ? `• ${p.nivel}` : ''} {p.diasPorSemana ? `• ${p.diasPorSemana}x/sem` : ''}</p>}
+
+                  {expandedPlano === p.id && (
+                    <>
+                      {/* Show structured dias if available (from AI) */}
+                      {p.dias && p.dias.length > 0 ? (
+                        p.dias.map((dia, dIdx) => (
+                          <div key={dIdx} className="dia-card">
+                            <h4>📅 {dia.nome}</h4>
+                            {dia.exercicios?.map((ex, eIdx) => (
+                              <div key={eIdx} className="dia-ex">
+                                <span><Dumbbell size={13} className="text-accent" style={{ marginRight: 6 }} />{ex.nome}</span>
+                                <span className="font-mono text-muted">{ex.series}x{ex.repeticoes} — {ex.carga || '?'} — ⏱ {ex.descanso || '60s'}</span>
+                              </div>
+                            ))}
+                          </div>
+                        ))
+                      ) : (
+                        /* Show flat exercicios array (manual plans) */
+                        (p.exercicios || []).map((ex, i) => (
+                          <div key={i} className="dia-ex">
+                            <span><Dumbbell size={13} className="text-accent" style={{ marginRight: 6 }} />{ex.nome}</span>
+                            <span className="font-mono text-muted">{ex.series}x{ex.reps} {ex.carga ? `• ${ex.carga}kg` : ''}</span>
+                          </div>
+                        ))
+                      )}
+                    </>
+                  )}
                 </div>
               ))}
             </div>
@@ -433,9 +460,9 @@ export default function Academia() {
           {isOpenPlano && (
             <Modal isOpen={isOpenPlano} onClose={() => setIsOpenPlano(false)} title={editingPlanoId ? 'Editar Plano' : 'Novo Plano'}>
               <form onSubmit={savePlano}>
-                <input className="input mb-md" placeholder="Nome do plano" value={planoForm.nome} onChange={e => setPlanoForm({ ...planoForm, nome: e.target.value })} required />
-                <h4 className="mb-sm">Exercícios ({planoForm.exercicios.length})</h4>
-                {planoForm.exercicios.map((ex, i) => (
+                <input className="input mb-md" placeholder="Nome do plano" value={planoForm.nome} onChange={e => setPlanoForm({ ...planoForm, nome: e.target.value })} required style={{ width: '100%', padding: 10, background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)' }} />
+                <h4 className="mb-sm">Exercícios ({planoForm.exercicios?.length || 0})</h4>
+                {(planoForm.exercicios || []).map((ex, i) => (
                   <div key={i} className="flex items-center gap-xs mb-xs" style={{ fontSize: '0.85rem' }}>
                     <span style={{ flex: 1 }}>{ex.nome}</span>
                     <span className="text-muted">{ex.series}x{ex.reps}</span>
@@ -443,13 +470,12 @@ export default function Academia() {
                   </div>
                 ))}
                 <div className="flex gap-xs mt-sm mb-md" style={{ flexWrap: 'wrap' }}>
-                  <input className="input" style={{ flex: 2 }} placeholder="Nome do exercício" value={exercicioForm.nome} onChange={e => setExercicioForm({ ...exercicioForm, nome: e.target.value })} />
-                  <input className="input" style={{ width: 60 }} placeholder="Séries" value={exercicioForm.series} onChange={e => setExercicioForm({ ...exercicioForm, series: e.target.value })} />
-                  <input className="input" style={{ width: 70 }} placeholder="Reps" value={exercicioForm.reps} onChange={e => setExercicioForm({ ...exercicioForm, reps: e.target.value })} />
-                  <input className="input" style={{ width: 60 }} placeholder="Carga" value={exercicioForm.carga} onChange={e => setExercicioForm({ ...exercicioForm, carga: e.target.value })} />
+                  <input style={{ flex: 2, padding: 8, background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)' }} placeholder="Exercício" value={exercicioForm.nome} onChange={e => setExercicioForm({ ...exercicioForm, nome: e.target.value })} />
+                  <input style={{ width: 55, padding: 8, background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)' }} placeholder="Séries" value={exercicioForm.series} onChange={e => setExercicioForm({ ...exercicioForm, series: e.target.value })} />
+                  <input style={{ width: 65, padding: 8, background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)' }} placeholder="Reps" value={exercicioForm.reps} onChange={e => setExercicioForm({ ...exercicioForm, reps: e.target.value })} />
                   <button type="button" className="btn btn-ghost" onClick={addExercicio}><Plus size={16} /></button>
                 </div>
-                <button type="submit" className="btn btn-primary w-100">Salvar</button>
+                <button type="submit" className="btn btn-primary" style={{ width: '100%' }}>Salvar</button>
               </form>
             </Modal>
           )}
@@ -464,7 +490,7 @@ export default function Academia() {
               <Play size={48} className="text-accent" style={{ marginBottom: 16 }} />
               <h3>Iniciar Treino</h3>
               <p className="text-muted mt-sm mb-lg">Selecione um plano para começar</p>
-              <select className="input mb-md" value={planoSel} onChange={e => setPlanoSel(e.target.value)} style={{ maxWidth: 300, margin: '0 auto' }}>
+              <select style={{ padding: 10, background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)', maxWidth: 300, width: '100%', margin: '0 auto' }} value={planoSel} onChange={e => setPlanoSel(e.target.value)}>
                 <option value="">Escolha um plano...</option>
                 {planos.map(p => <option key={p.id} value={p.id}>{p.nome}</option>)}
               </select>
@@ -481,26 +507,27 @@ export default function Academia() {
                 <div key={i} className="card mb-sm">
                   <div className="flex justify-between items-center">
                     <div className="flex items-center gap-sm">
-                      <Checkbox checked={ex.concluido} onChange={() => {
+                      <input type="checkbox" checked={ex.concluido} onChange={() => {
                         const updated = { ...treinoAtivo };
-                        updated.exercicios[i].concluido = !ex.concluido;
-                        setTreinoAtivo({ ...updated });
+                        updated.exercicios = [...updated.exercicios];
+                        updated.exercicios[i] = { ...ex, concluido: !ex.concluido };
+                        setTreinoAtivo(updated);
                       }} />
                       <span style={{ textDecoration: ex.concluido ? 'line-through' : 'none', opacity: ex.concluido ? 0.5 : 1 }}>{ex.nome}</span>
                     </div>
                     <span className="font-mono text-muted">{ex.series}x{ex.reps}</span>
                   </div>
                   <div className="flex gap-sm mt-sm">
-                    <input className="input" style={{ width: 80 }} placeholder="Carga" value={ex.cargaReal} onChange={e => {
+                    <input style={{ width: 80, padding: 8, background: 'var(--surface2)', border: '1px solid var(--border)', borderRadius: 8, color: 'var(--text)' }} placeholder="Carga" value={ex.cargaReal} onChange={e => {
                       const upd = { ...treinoAtivo };
-                      upd.exercicios[i].cargaReal = e.target.value;
-                      setTreinoAtivo({ ...upd });
+                      upd.exercicios = [...upd.exercicios];
+                      upd.exercicios[i] = { ...ex, cargaReal: e.target.value };
+                      setTreinoAtivo(upd);
                     }} />
                     <span className="text-muted flex items-center" style={{ fontSize: '0.8rem' }}>kg</span>
                   </div>
                 </div>
               ))}
-              <textarea className="input mt-md" placeholder="Observações do treino..." value={treinoAtivo.observacoes} onChange={e => setTreinoAtivo({ ...treinoAtivo, observacoes: e.target.value })} rows={3} style={{ width: '100%', resize: 'vertical' }} />
             </div>
           )}
         </div>
@@ -511,21 +538,21 @@ export default function Academia() {
         <div>
           <div className="flex gap-md mb-lg" style={{ flexWrap: 'wrap' }}>
             <div className="card" style={{ flex: 1, minWidth: 150, textAlign: 'center' }}>
-              <div style={{ fontSize: '2rem', fontWeight: 800, fontFamily: 'var(--font-heading)' }}>{treinos.length}</div>
+              <div style={{ fontSize: '2rem', fontWeight: 800 }}>{treinos.length}</div>
               <div className="text-muted">Total de treinos</div>
             </div>
             <div className="card" style={{ flex: 1, minWidth: 150, textAlign: 'center' }}>
-              <div style={{ fontSize: '2rem', fontWeight: 800, fontFamily: 'var(--font-heading)', color: 'var(--accent)' }}>🔥 {streak}</div>
+              <div style={{ fontSize: '2rem', fontWeight: 800, color: 'var(--accent)' }}>🔥 {streak}</div>
               <div className="text-muted">Streak atual</div>
             </div>
             <div className="card" style={{ flex: 1, minWidth: 150, textAlign: 'center' }}>
-              <div style={{ fontSize: '2rem', fontWeight: 800, fontFamily: 'var(--font-heading)', color: 'var(--green)' }}>{treinosOrd[0]?.data || '-'}</div>
+              <div style={{ fontSize: '1.2rem', fontWeight: 800, color: 'var(--green)' }}>{treinosOrd[0]?.data || '-'}</div>
               <div className="text-muted">Último treino</div>
             </div>
           </div>
 
           <div className="card mb-lg">
-            <h3 className="mb-md">📊 Treinos por Semana (últimas 8 semanas)</h3>
+            <h3 className="mb-md">📊 Treinos por Semana</h3>
             <ResponsiveContainer width="100%" height={200}>
               <BarChart data={treinosPorSemana} margin={{ top: 5, right: 10, left: -20, bottom: 5 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#252538" vertical={false} />
@@ -538,7 +565,7 @@ export default function Academia() {
           </div>
 
           {treinos.length > 0 && (
-            <div className="mt-lg">
+            <div>
               <h3 className="mb-md text-muted">Últimos 10 treinos</h3>
               <div className="table-wrapper"><table className="table"><thead><tr><th>Data</th><th>Plano</th><th>Exercícios</th></tr></thead>
               <tbody>{treinosOrd.slice(0, 10).map(t => <tr key={t.id}><td>{t.data}</td><td>{t.planoNome || '-'}</td><td>{t.exercicios?.length || 0}</td></tr>)}</tbody></table></div>
@@ -546,11 +573,6 @@ export default function Academia() {
           )}
         </div>
       )}
-
-      <ConfirmDialog isOpen={isConfirmOpen} onClose={() => setIsConfirmOpen(false)} onConfirm={() => {
-        if (itemToDelete) deleteItem(itemToDelete.type === 'plano' ? 'planos' : 'treinos', itemToDelete.id);
-        setIsConfirmOpen(false);
-      }} message="Tem certeza que deseja deletar este item?" />
     </div>
   );
 }

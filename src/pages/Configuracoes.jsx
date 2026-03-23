@@ -6,12 +6,12 @@ import { Download, Upload, AlertTriangle, Key, HardDrive, Shield } from 'lucide-
 export default function Configuracoes() {
   const { state, setConfig, importState, clearAll } = useApp();
   
-  const [apiKeyInput, setApiKeyInput] = useState(state.config?.claudeApiKey || '');
+  const [apiKeyInput, setApiKeyInput] = useState(state.config?.groqApiKey || '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');
   const [apiKeySaved, setApiKeySaved] = useState(false);
   const [isConfirmClearOpen, setIsConfirmClearOpen] = useState(false);
 
   const handleSaveApiKey = () => {
-    setConfig('claudeApiKey', apiKeyInput);
+    setConfig('groqApiKey', apiKeyInput);
     setApiKeySaved(true);
     setTimeout(() => setApiKeySaved(false), 2000);
   };
@@ -71,8 +71,8 @@ export default function Configuracoes() {
               <Key size={24} className="text-accent" />
             </div>
             <div>
-              <h2 style={{ fontSize: '1.2rem', marginBottom: '4px' }}>API Key da Anthropic (Claude)</h2>
-              <p className="text-muted" style={{ fontSize: '0.9rem' }}>Obtenha em console.anthropic.com — Usado por todos os assistentes IA</p>
+              <h2 style={{ fontSize: '1.2rem', marginBottom: '4px' }}>API Key do Groq</h2>
+              <p className="text-muted" style={{ fontSize: '0.9rem' }}>Obtenha sua chave gratuita em console.groq.com</p>
             </div>
           </div>
           
@@ -83,7 +83,7 @@ export default function Configuracoes() {
                 type="password" 
                 value={apiKeyInput}
                 onChange={e => setApiKeyInput(e.target.value)}
-                placeholder="sk-ant-..."
+                placeholder="gsk_..."
                 autoComplete="off"
               />
             </div>
