@@ -1,30 +1,40 @@
 import { useState, useRef, useEffect } from 'react';
 import { useApp } from '../context/AppContext';
-import Groq from "groq-sdk";
-import { Send, Bot, User, BrainCircuit, Key, Loader2, Trash2 } from 'lucide-react';
-import { Link } from 'react-router-dom';
+import { callClaude } from '../utils/claudeApi';
+import ReactMarkdown from 'react-markdown';
+import { Send, Bot, User, BrainCircuit, Loader2, Trash2 } from 'lucide-react';
+
+const MD_COMPONENTS = {
+  p: ({ children }) => <p style={{ marginBottom: 8 }}>{children}</p>,
+  strong: ({ children }) => <strong style={{ color: '#eeeef5' }}>{children}</strong>,
+  ul: ({ children }) => <ul style={{ paddingLeft: 16, marginBottom: 8 }}>{children}</ul>,
+  ol: ({ children }) => <ol style={{ paddingLeft: 16, marginBottom: 8 }}>{children}</ol>,
+  li: ({ children }) => <li style={{ marginBottom: 4 }}>{children}</li>,
+  h1: ({ children }) => <h3 style={{ color: '#7c6aff', marginBottom: 8 }}>{children}</h3>,
+  h2: ({ children }) => <h4 style={{ color: '#7c6aff', marginBottom: 8 }}>{children}</h4>,
+  h3: ({ children }) => <h5 style={{ color: '#7c6aff', marginBottom: 6 }}>{children}</h5>,
+  code: ({ children }) => <code style={{ background: 'rgba(124,106,255,0.15)', padding: '2px 6px', borderRadius: 4, fontSize: '0.85em' }}>{children}</code>,
+};
 
 export default function AssistenteIA() {
   const { state } = useApp();
-  const apiKey = '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';
-  
+  const apiKey = state.config?.claudeApiKey || '';
+
   const [messages, setMessages] = useState(() => {
     const saved = localStorage.getItem('segundo-cerebro-chat');
     return saved ? JSON.parse(saved) : [
-      { role: 'assistant', content: 'Olá! Sou seu assistente de Segundo Cérebro. Tenho acesso aos seus dados financeiros, tarefas, saúde e metas. Como posso ajudar você hoje?' }
+      { role: 'assistant', content: 'Olá! Sou seu assistente de **Segundo Cérebro**, powered by Claude. Tenho acesso aos seus dados financeiros, tarefas, saúde e metas. Como posso ajudar você hoje?' }
     ];
   });
-  
+
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef(null);
 
-  // Auto-scroll para a última mensagem
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Salvar chat no localStorage separado (para não sujar o state global rápido já que cresce)
   useEffect(() => {
     localStorage.setItem('segundo-cerebro-chat', JSON.stringify(messages));
   }, [messages]);
@@ -34,16 +44,19 @@ export default function AssistenteIA() {
   };
 
   const parseStateForContext = () => {
-    // Clonamos o estado mas omitimos configurações sensíveis/irrelevantes para o LLM
     const { config, ...dadosRelevantes } = state;
-    
-    // Podemos formatar um pouco melhor ou só jogar o JSON stringificado.
     return JSON.stringify(dadosRelevantes, null, 2);
   };
 
   const handleSend = async (e) => {
     e.preventDefault();
-    if (!input.trim() || !apiKey) return;
+    if (!input.trim()) return;
+
+    if (!apiKey) {
+      setMessages(prev => [...prev, { role: 'user', content: input.trim() }, { role: 'assistant', content: '❌ **API Key não configurada.** Vá em ⚙️ Configurações e adicione sua API Key da Anthropic (Claude).' }]);
+      setInput('');
+      return;
+    }
 
     const userText = input.trim();
     const newMessages = [...messages, { role: 'user', content: userText }];
@@ -52,13 +65,8 @@ export default function AssistenteIA() {
     setIsLoading(true);
 
     try {
-      const groq = new Groq({
-        apiKey: apiKey,
-        dangerouslyAllowBrowser: true
-      });
-
-      const systemPrompt = `Você é o "Assistente IA" do "Segundo Cérebro", um aplicativo de produtividade pessoal e finanças.
-O usuário te deu acesso total e local aos dados dele. Ajude-o a analisar suas finanças, lembrar de tarefas, recomendar focar em metas, e responder perguntas com base nos dados.
+      const systemPrompt = `Você é o "Assistente IA" do "Segundo Cérebro", um app de produtividade pessoal e finanças.
+O usuário te deu acesso total e local aos dados dele. Ajude-o a analisar finanças, lembrar de tarefas, recomendar focar em metas, e responder perguntas com base nos dados.
 
 DADOS ATUAIS DO USUÁRIO (Formato JSON):
 \`\`\`json
@@ -69,147 +77,94 @@ REGRAS:
 1. Responda sempre em PT-BR de forma amigável, concisa e direta.
 2. Formate dados monetários como "R$ X.XXX,XX".
 3. Se um dado não estiver no JSON acima, diga que não encontrou a informação.
-4. Você pode usar Markdown na sua resposta livremente.`;
+4. Use Markdown na sua resposta (negrito, listas, etc).`;
 
-      const chatHistory = messages.filter(m => m.content).map(m => ({
-        role: m.role,
-        content: m.content
-      }));
-
-      const completion = await groq.chat.completions.create({
-        model: "llama-3.3-70b-versatile",
-        max_tokens: 2048,
-        messages: [
-          { role: "system", content: systemPrompt },
-          ...chatHistory,
-          { role: "user", content: userText }
-        ]
-      });
-
-      const botReply = completion.choices[0].message.content;
-      setMessages(prev => [...prev, { role: 'assistant', content: botReply }]);
-      
-    } catch (error) {
-      console.error(error);
-      setMessages(prev => [...prev, { 
-        role: 'assistant', 
-        content: `❌ **Ocorreu um erro:** ${error.message || 'Falha ao contatar a API do Groq. Verifique sua chave API ou conexão.'}` 
-      }]);
-    } finally {
-      setIsLoading(false);
+      const chatHistory = newMessages.slice(-20).map(m => ({ role: m.role, content: m.content }));
+      const responseText = await callClaude(systemPrompt, chatHistory, apiKey);
+      setMessages(prev => [...prev, { role: 'assistant', content: responseText }]);
+    } catch (err) {
+      setMessages(prev => [...prev, { role: 'assistant', content: `❌ Erro: ${err.message}` }]);
     }
+    setIsLoading(false);
   };
 
-  if (!apiKey) {
-    return (
-      <div className="card p-xl flex-col items-center justify-center text-center mt-xl" style={{ maxWidth: 600, margin: '40px auto' }}>
-        <Key size={64} className="text-muted mb-md" />
-        <h2>API Key Necessária</h2>
-        <p className="text-muted mb-lg" style={{ lineHeight: 1.6 }}>
-          Configure sua API Key do Groq em ⚙️ Configurações. Obtenha gratuitamente em console.groq.com
-        </p>
-        <Link to="/configuracoes" className="btn btn-primary">
-          <Key size={18} /> Configurar API Key
-        </Link>
-      </div>
-    );
-  }
-
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: 'calc(100vh - 120px)' }}>
-      <div className="page-header flex justify-between items-center mb-0" style={{ paddingBottom: '16px', borderBottom: '1px solid var(--border)' }}>
-        <div>
-          <h1 className="flex items-center gap-sm"><BrainCircuit className="text-accent" /> Assistente IA</h1>
-          <p>Seu assistente pessoal com contexto total da sua vida</p>
-        </div>
-        <button className="btn btn-ghost btn-sm text-muted" onClick={clearChat} title="Limpar Histórico">
-          <Trash2 size={16} /> Limpar
-        </button>
-      </div>
+    <div>
+      <style>{`
+        .ai-container { max-width: 900px; margin: 0 auto; }
+        .ai-header { margin-bottom: 24px; }
+        .ai-header h1 { display: flex; align-items: center; gap: 12px; }
+        .ai-chat-area { display: flex; flex-direction: column; height: calc(100vh - 220px); background: var(--surface); border: 1px solid var(--border); border-radius: 16px; overflow: hidden; }
+        .ai-messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+        .ai-messages::-webkit-scrollbar { width: 4px; }
+        .ai-messages::-webkit-scrollbar-thumb { background: #252538; border-radius: 4px; }
+        .ai-msg { max-width: 82%; display: flex; gap: 12px; }
+        .ai-msg.user { align-self: flex-end; flex-direction: row-reverse; }
+        .ai-msg.assistant { align-self: flex-start; }
+        .ai-avatar { width: 32px; height: 32px; border-radius: 10px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+        .ai-avatar.user { background: linear-gradient(135deg, var(--accent), var(--accent2)); }
+        .ai-avatar.assistant { background: var(--surface2); border: 1px solid var(--border); }
+        .ai-bubble { padding: 14px 18px; border-radius: 16px; font-size: 0.9rem; line-height: 1.6; }
+        .ai-bubble.user { background: linear-gradient(135deg, var(--accent), #5a4fd4); color: #fff; border-bottom-right-radius: 4px; }
+        .ai-bubble.assistant { background: var(--surface2); border-bottom-left-radius: 4px; }
+        .ai-input-bar { display: flex; gap: 8px; padding: 16px; border-top: 1px solid var(--border); background: var(--surface); }
+        .ai-input-bar input { flex: 1; background: var(--surface2); border: 1px solid var(--border); border-radius: 12px; padding: 12px 16px; color: var(--text); font-size: 0.9rem; outline: none; }
+        .ai-input-bar input:focus { border-color: var(--accent); }
+        .ai-send-btn { width: 44px; height: 44px; border-radius: 12px; background: linear-gradient(135deg, var(--accent), var(--accent2)); border: none; color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: transform 0.15s; }
+        .ai-send-btn:hover { transform: scale(1.05); }
+        .ai-send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .no-key-banner { padding: 16px; background: rgba(255,106,155,0.1); border: 1px solid var(--accent2); border-radius: 12px; margin-bottom: 16px; font-size: 0.85rem; }
+        @media (max-width: 768px) { .ai-chat-area { height: calc(100vh - 280px); } .ai-msg { max-width: 92%; } }
+      `}</style>
 
-      <div className="chat-container flex-col p-md" style={{ flex: 1, overflowY: 'auto', gap: '24px' }}>
-        {messages.map((msg, i) => {
-          const isBot = msg.role === 'assistant';
-          return (
-            <div key={i} className={`flex gap-md ${isBot ? 'items-start' : 'items-start flex-row-reverse'}`}>
-              <div 
-                className="flex items-center justify-center" 
-                style={{ 
-                  width: 40, height: 40, borderRadius: '50%', flexShrink: 0,
-                  background: isBot ? 'var(--surface2)' : 'var(--accent)',
-                  color: isBot ? 'var(--accent)' : '#fff',
-                  border: isBot ? '1px solid var(--border)' : 'none'
-                }}
-              >
-                {isBot ? <Bot size={20} /> : <User size={20} />}
-              </div>
-              
-              <div 
-                className={`markdown-body ${isBot ? 'bot-bubble' : 'user-bubble'}`}
-                style={{
-                  maxWidth: '75%',
-                  padding: '16px 20px',
-                  borderRadius: '16px',
-                  borderTopLeftRadius: isBot ? 4 : 16,
-                  borderTopRightRadius: !isBot ? 4 : 16,
-                  background: isBot ? 'var(--surface)' : 'rgba(124, 106, 255, 0.15)',
-                  border: isBot ? '1px solid var(--border)' : '1px solid rgba(124, 106, 255, 0.3)',
-                  color: 'var(--text)',
-                  fontSize: '0.95rem',
-                  lineHeight: 1.6,
-                  whiteSpace: 'pre-wrap'
-                }}
-              >
-                {/* Aqui poderíamos usar um ReactMarkdown, porém para manter simples sem libs extra, renderizamos texto puro. O Markdown básico será meio texto puro, mas espaçado. */}
-                {msg.content}
-              </div>
-            </div>
-          );
-        })}
-        {isLoading && (
-          <div className="flex gap-md items-start">
-             <div className="flex items-center justify-center" style={{ width: 40, height: 40, borderRadius: '50%', background: 'var(--surface2)', color: 'var(--accent)', border: '1px solid var(--border)' }}>
-                <Bot size={20} />
-             </div>
-             <div className="bot-bubble flex items-center" style={{ padding: '16px 24px', borderRadius: '16px', borderTopLeftRadius: 4, background: 'var(--surface)', border: '1px solid var(--border)' }}>
-               <Loader2 size={20} className="spin text-accent" />
-               <span className="ml-sm text-muted ml-sm" style={{ marginLeft: '8px' }}>Pensando...</span>
-             </div>
+      <div className="ai-container">
+        <div className="ai-header">
+          <h1><BrainCircuit size={28} className="text-accent" /> Assistente IA</h1>
+          <p className="text-muted">Powered by Claude — Analise seus dados, planeje e organize</p>
+        </div>
+
+        {!apiKey && (
+          <div className="no-key-banner">
+            ⚠️ <strong>API Key não configurada.</strong> Vá em ⚙️ Configurações e adicione sua API Key da Anthropic para usar o assistente.
           </div>
         )}
-        <div ref={messagesEndRef} />
-      </div>
 
-      <form 
-        onSubmit={handleSend} 
-        className="chat-input-area" 
-        style={{ 
-          padding: '16px', 
-          borderTop: '1px solid var(--border)',
-          background: 'var(--bg)',
-          position: 'sticky',
-          bottom: 0
-        }}
-      >
-        <div className="flex items-center gap-sm" style={{ background: 'var(--surface)', padding: '8px', borderRadius: 'var(--radius)', border: '1px solid var(--border)' }}>
-          <input 
-            type="text" 
-            value={input}
-            onChange={e => setInput(e.target.value)}
-            disabled={isLoading}
-            placeholder="Pergunte algo sobre seus dados, tarefas atrasadas, saldos..."
-            style={{ flex: 1, background: 'transparent', border: 'none', padding: '8px 16px', fontSize: '1rem', color: 'var(--text)', outline: 'none' }}
-          />
-          <button 
-            type="submit" 
-            className="btn btn-primary" 
-            disabled={isLoading || !input.trim()}
-            style={{ width: 44, height: 44, padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 'var(--radius-sm)' }}
-          >
-            <Send size={18} />
-          </button>
+        <div className="ai-chat-area">
+          <div className="ai-messages">
+            {messages.map((m, i) => (
+              <div key={i} className={`ai-msg ${m.role}`}>
+                <div className={`ai-avatar ${m.role}`}>
+                  {m.role === 'user' ? <User size={16} /> : <Bot size={16} />}
+                </div>
+                <div className={`ai-bubble ${m.role}`}>
+                  {m.role === 'assistant' ? (
+                    <ReactMarkdown components={MD_COMPONENTS}>{m.content}</ReactMarkdown>
+                  ) : m.content}
+                </div>
+              </div>
+            ))}
+            {isLoading && (
+              <div className="ai-msg assistant">
+                <div className="ai-avatar assistant"><Bot size={16} /></div>
+                <div className="ai-bubble assistant flex items-center gap-sm">
+                  <Loader2 size={16} className="spin" /> Claude está pensando...
+                </div>
+              </div>
+            )}
+            <div ref={messagesEndRef} />
+          </div>
+          <form className="ai-input-bar" onSubmit={handleSend}>
+            <input value={input} onChange={e => setInput(e.target.value)} placeholder="Pergunte ao Claude..." disabled={isLoading} />
+            <button type="submit" className="ai-send-btn" disabled={isLoading || !input.trim()}>
+              <Send size={18} />
+            </button>
+          </form>
         </div>
-      </form>
+
+        <button className="btn btn-ghost mt-sm" style={{ fontSize: '0.8rem' }} onClick={clearChat}>
+          <Trash2 size={14} /> Limpar chat
+        </button>
+      </div>
     </div>
   );
 }

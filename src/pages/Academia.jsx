@@ -2,11 +2,12 @@ import { useState, useRef, useEffect, useMemo } from 'react';
 import { useApp } from '../context/AppContext';
 import { useAuth } from '../context/AuthContext';
 import { db } from '../firebase';
-import { doc, updateDoc, serverTimestamp } from 'firebase/firestore';
-import Groq from 'groq-sdk';
+import { serverTimestamp } from 'firebase/firestore';
+import { callClaude, extractPlan } from '../utils/claudeApi';
+import ReactMarkdown from 'react-markdown';
 import { Modal, EmptyState, ConfirmDialog, formatDate, getToday, Checkbox } from '../components/shared';
-import { Plus, Edit2, Trash2, Activity, Play, Calendar, CheckCircle2, Send, Loader2, Dumbbell, LineChart as LineChartIcon, BarChart3, Timer } from 'lucide-react';
-import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, Legend, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar } from 'recharts';
+import { Plus, Edit2, Trash2, Activity, Play, CheckCircle2, Send, Loader2, Dumbbell, Save } from 'lucide-react';
+import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar, Legend } from 'recharts';
 
 const TABS = ['🤖 Personal IA', '📏 Métricas', '📋 Planos', '💪 Registrar Treino', '📊 Estatísticas'];
 
@@ -18,6 +19,18 @@ const QUICK_MSGS = [
   'Treino para emagrecer',
   'Treino em casa',
 ];
+
+const MD_COMPONENTS = {
+  p: ({ children }) => <p style={{ marginBottom: 8 }}>{children}</p>,
+  strong: ({ children }) => <strong style={{ color: '#eeeef5' }}>{children}</strong>,
+  ul: ({ children }) => <ul style={{ paddingLeft: 16, marginBottom: 8 }}>{children}</ul>,
+  ol: ({ children }) => <ol style={{ paddingLeft: 16, marginBottom: 8 }}>{children}</ol>,
+  li: ({ children }) => <li style={{ marginBottom: 4 }}>{children}</li>,
+  h1: ({ children }) => <h3 style={{ color: '#a2ff00', marginBottom: 8 }}>{children}</h3>,
+  h2: ({ children }) => <h4 style={{ color: '#a2ff00', marginBottom: 8 }}>{children}</h4>,
+  h3: ({ children }) => <h5 style={{ color: '#a2ff00', marginBottom: 6 }}>{children}</h5>,
+  code: ({ children }) => <code style={{ background: 'rgba(162,255,0,0.1)', padding: '2px 6px', borderRadius: 4, fontSize: '0.85em' }}>{children}</code>,
+};
 
 function calcularStreak(treinosOrdenados) {
   if (!treinosOrdenados.length) return 0;
@@ -61,14 +74,29 @@ HISTÓRICO:
 Suas capacidades: criar programas de treino, sugerir progressão, explicar exercícios, adaptar para limitações, calcular volume/intensidade, analisar histórico, motivar.
 Quando criar plano: divisão de treino, exercícios/séries/reps/carga/descanso por dia, aquecimento/alongamento, dicas de execução.
 Pergunte sobre objetivo, nível, dias disponíveis e limitações antes de criar plano.
-Responda SEMPRE em português brasileiro. Seja motivador e técnico.`;
+Responda SEMPRE em português brasileiro. Seja motivador e técnico. Use Markdown.
+
+INSTRUÇÃO ESPECIAL — CRIAÇÃO DE PLANOS DE TREINO:
+Quando o usuário pedir para criar um plano de treino, SEMPRE inclua no FINAL da mensagem um bloco JSON entre as tags <PLANO_TREINO> e </PLANO_TREINO>:
+<PLANO_TREINO>
+{
+  "nome": "Nome do Plano",
+  "objetivo": "Hipertrofia/Emagrecimento/etc",
+  "nivel": "Iniciante/Intermediário/Avançado",
+  "diasPorSemana": 3,
+  "exercicios": [
+    { "nome": "Supino reto", "series": "3", "reps": "8-12", "carga": "", "obs": "Foco na contração" },
+    { "nome": "Crucifixo", "series": "3", "reps": "10-15", "carga": "", "obs": "" }
+  ]
+}
+</PLANO_TREINO>`;
 }
 
 export default function Academia() {
   const { state, addItem, updateItem, deleteItem } = useApp();
   const { user } = useAuth();
   const [tab, setTab] = useState(0);
-  const apiKey = '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';
+  const apiKey = state.config?.claudeApiKey || '';
 
   const planos = state.academia?.planos || [];
   const treinos = state.academia?.treinos || [];
@@ -83,6 +111,7 @@ export default function Academia() {
   });
   const [chatInput, setChatInput] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
+  const [pendingPlan, setPendingPlan] = useState(null);
   const endRef = useRef(null);
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
@@ -90,19 +119,36 @@ export default function Academia() {
 
   const sendChat = async (text) => {
     if (!text?.trim()) return;
+    if (!apiKey) {
+      setMessages(prev => [...prev, { role: 'user', content: text.trim() }, { role: 'assistant', content: '❌ **API Key não configurada.** Vá em ⚙️ Configurações e adicione sua API Key da Anthropic.' }]);
+      setChatInput('');
+      return;
+    }
     const newMsgs = [...messages, { role: 'user', content: text.trim() }];
     setMessages(newMsgs); setChatInput(''); setChatLoading(true);
     try {
-      const groq = new Groq({ apiKey, dangerouslyAllowBrowser: true });
       const systemPrompt = getContextoAcademia(user, metricas, planos, treinos);
-      const completion = await groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        messages: [{ role: 'system', content: systemPrompt }, ...newMsgs.slice(-20).map(m => ({ role: m.role, content: m.content }))],
-        temperature: 0.7, max_tokens: 2048,
-      });
-      setMessages(prev => [...prev, { role: 'assistant', content: completion.choices[0]?.message?.content || 'Não consegui gerar resposta.' }]);
-    } catch { setMessages(prev => [...prev, { role: 'assistant', content: '❌ Erro ao conectar com a IA.' }]); }
+      const chatHistory = newMsgs.slice(-20).map(m => ({ role: m.role, content: m.content }));
+      const responseText = await callClaude(systemPrompt, chatHistory, apiKey);
+
+      const { cleanText, planData } = extractPlan(responseText, 'PLANO_TREINO');
+      if (planData) setPendingPlan(planData);
+      setMessages(prev => [...prev, { role: 'assistant', content: cleanText }]);
+    } catch (err) {
+      setMessages(prev => [...prev, { role: 'assistant', content: `❌ Erro: ${err.message}` }]);
+    }
     setChatLoading(false);
+  };
+
+  const savePlanFromAI = async () => {
+    if (!pendingPlan) return;
+    try {
+      await addItem('planos', { ...pendingPlan, criadoPorIA: true });
+      setMessages(prev => [...prev, { role: 'assistant', content: '✅ **Plano salvo com sucesso!** Acesse a aba "📋 Planos" para visualizar.' }]);
+      setPendingPlan(null);
+    } catch (e) {
+      setMessages(prev => [...prev, { role: 'assistant', content: '❌ Erro ao salvar plano: ' + e.message }]);
+    }
   };
 
   // ============ TAB 1: MÉTRICAS ============
@@ -114,12 +160,11 @@ export default function Academia() {
   const saveMetrica = async (e) => {
     e.preventDefault();
     if (!metForm.peso) return;
-    await addItem('metricas', { ...metForm, imc: imc || '', criadoEm: serverTimestamp() });
+    await addItem('metricas', { ...metForm, imc: imc || '' });
     setShowMetForm(false);
     setMetForm({ peso: '', altura: '', gordura: '', massa: '', cintura: '', quadril: '', peito: '', braco: '', coxa: '', objetivo: '', nivel: '', limitacoes: '', data: getToday() });
   };
 
-  // Gráfico de evolução Peso
   const pesoData = useMemo(() => [...metricas].reverse().filter(m => m.peso).map(m => ({
     label: m.data || '', peso: Number(m.peso), gordura: Number(m.gordura) || 0, massa: Number(m.massa) || 0
   })), [metricas]);
@@ -154,7 +199,7 @@ export default function Academia() {
 
   const finalizarTreino = async () => {
     if (!treinoAtivo) return;
-    await addItem('treinos', { ...treinoAtivo, finalizado: true, criadoEm: serverTimestamp() });
+    await addItem('treinos', { ...treinoAtivo, finalizado: true });
     setTreinoAtivo(null);
   };
 
@@ -178,37 +223,49 @@ export default function Academia() {
       <style>{`
         .acad-tabs { display: flex; gap: 4px; background: var(--surface); border-radius: 12px; padding: 4px; margin-bottom: 24px; overflow-x: auto; }
         .acad-tab { padding: 10px 16px; border-radius: 8px; font-size: 0.82rem; font-weight: 600; cursor: pointer; background: transparent; border: none; color: var(--text-secondary); transition: all 0.2s; white-space: nowrap; }
-        .acad-tab.active { background: var(--accent); color: #fff; }
+        .acad-tab.active { background: #a2ff00; color: #000; }
         .acad-tab:hover:not(.active) { background: var(--surface2); }
 
         .chat-area { display: flex; flex-direction: column; height: calc(100vh - 220px); background: var(--surface); border: 1px solid var(--border); border-radius: 16px; overflow: hidden; }
         .chat-msgs { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
         .chat-msgs::-webkit-scrollbar { width: 4px; } .chat-msgs::-webkit-scrollbar-thumb { background: #252538; border-radius: 4px; }
-        .chat-bubble { max-width: 80%; padding: 14px 18px; border-radius: 16px; font-size: 0.9rem; line-height: 1.5; white-space: pre-wrap; }
+        .chat-bubble { max-width: 80%; padding: 14px 18px; border-radius: 16px; font-size: 0.9rem; line-height: 1.6; }
         .chat-bubble.user { align-self: flex-end; background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff; border-bottom-right-radius: 4px; }
         .chat-bubble.assistant { align-self: flex-start; background: var(--surface2); border-bottom-left-radius: 4px; }
         .chat-input-bar { display: flex; gap: 8px; padding: 16px; border-top: 1px solid var(--border); background: var(--surface); }
         .chat-input-bar input { flex: 1; background: var(--surface2); border: 1px solid var(--border); border-radius: 12px; padding: 12px 16px; color: var(--text); font-size: 0.9rem; outline: none; }
-        .chat-input-bar input:focus { border-color: var(--accent); }
-        .chat-send { width: 44px; height: 44px; border-radius: 12px; background: linear-gradient(135deg, var(--accent), var(--accent2)); border: none; color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+        .chat-input-bar input:focus { border-color: #a2ff00; }
+        .chat-send { width: 44px; height: 44px; border-radius: 12px; background: linear-gradient(135deg, #a2ff00, #00e676); border: none; color: #000; cursor: pointer; display: flex; align-items: center; justify-content: center; }
         .quick-chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
         .quick-chip { padding: 8px 14px; border-radius: 20px; font-size: 0.78rem; background: var(--surface2); border: 1px solid var(--border); color: var(--text-secondary); cursor: pointer; transition: all 0.2s; }
-        .quick-chip:hover { border-color: var(--accent); color: var(--text); }
+        .quick-chip:hover { border-color: #a2ff00; color: var(--text); }
+
+        .save-plan-card { background: rgba(162,255,0,0.08); border: 1px solid #a2ff00; border-radius: 12px; padding: 16px; margin: 12px 0; display: flex; align-items: center; gap: 12px; align-self: flex-start; max-width: 80%; }
+        .save-plan-btn { padding: 8px 20px; border-radius: 8px; background: #a2ff00; color: #000; border: none; cursor: pointer; font-weight: 700; font-size: 0.85rem; display: flex; align-items: center; gap: 6px; }
 
         .metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
         .metric-input label { font-size: 0.8rem; color: var(--text-secondary); display: block; margin-bottom: 4px; }
         .metric-input input, .metric-input select { width: 100%; padding: 10px; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-size: 0.9rem; }
 
+        .no-key-banner { padding: 16px; background: rgba(255,106,155,0.1); border: 1px solid var(--accent2); border-radius: 12px; margin-bottom: 16px; font-size: 0.85rem; }
+
         @media (max-width: 768px) {
           .chat-area { height: calc(100vh - 280px); }
-          .chat-bubble { max-width: 92%; }
+          .chat-bubble, .save-plan-card { max-width: 92%; }
           .metric-grid { grid-template-columns: 1fr 1fr; }
         }
       `}</style>
 
       <div className="page-header mb-md">
         <h1>💪 Academia</h1>
+        <p className="text-muted">Powered by Claude — Max, seu personal trainer virtual</p>
       </div>
+
+      {!apiKey && (
+        <div className="no-key-banner">
+          ⚠️ <strong>API Key não configurada.</strong> Vá em ⚙️ Configurações e adicione sua API Key da Anthropic (Claude).
+        </div>
+      )}
 
       <div className="acad-tabs">
         {TABS.map((t, i) => (
@@ -224,7 +281,19 @@ export default function Academia() {
           </div>
           <div className="chat-area">
             <div className="chat-msgs">
-              {messages.map((m, i) => <div key={i} className={`chat-bubble ${m.role}`}>{m.content}</div>)}
+              {messages.map((m, i) => (
+                <div key={i} className={`chat-bubble ${m.role}`}>
+                  {m.role === 'assistant' ? (
+                    <ReactMarkdown components={MD_COMPONENTS}>{m.content}</ReactMarkdown>
+                  ) : m.content}
+                </div>
+              ))}
+              {pendingPlan && (
+                <div className="save-plan-card">
+                  <span>💪 Max criou um plano de treino para você!</span>
+                  <button className="save-plan-btn" onClick={savePlanFromAI}><Save size={16} /> Salvar Plano</button>
+                </div>
+              )}
               {chatLoading && <div className="chat-bubble assistant flex items-center gap-sm"><Loader2 size={16} className="spin" /> Max está pensando...</div>}
               <div ref={endRef} />
             </div>
@@ -233,7 +302,7 @@ export default function Academia() {
               <button type="submit" className="chat-send" disabled={chatLoading || !chatInput.trim()}><Send size={18} /></button>
             </form>
           </div>
-          <button className="btn btn-ghost mt-sm" style={{ fontSize: '0.8rem' }} onClick={() => setMessages([{ role: 'assistant', content: 'Chat reiniciado. Bora treinar! 💪' }])}>
+          <button className="btn btn-ghost mt-sm" style={{ fontSize: '0.8rem' }} onClick={() => { setMessages([{ role: 'assistant', content: 'Chat reiniciado. Bora treinar! 💪' }]); setPendingPlan(null); }}>
             <Trash2 size={14} /> Limpar chat
           </button>
         </>
@@ -242,7 +311,6 @@ export default function Academia() {
       {/* TAB 1: Métricas */}
       {tab === 1 && (
         <div>
-          {/* Resumo */}
           {metricas.length > 0 && (
             <div className="card mb-lg flex items-center gap-lg" style={{ flexWrap: 'wrap' }}>
               <div><span className="text-muted" style={{ fontSize: '0.8rem' }}>Última medição</span><div className="font-mono">{ultMetrica.data || '-'}</div></div>
@@ -292,7 +360,6 @@ export default function Academia() {
             </form>
           )}
 
-          {/* Gráficos de Evolução */}
           {pesoData.length > 1 && (
             <div className="card">
               <h3 className="mb-md">📈 Evolução Corporal</h3>
@@ -311,7 +378,6 @@ export default function Academia() {
             </div>
           )}
 
-          {/* Histórico */}
           {metricas.length > 0 && (
             <div className="mt-lg">
               <h3 className="mb-md text-muted">Histórico de Medições</h3>
@@ -340,12 +406,16 @@ export default function Academia() {
               {planos.map(p => (
                 <div key={p.id} className="card">
                   <div className="flex justify-between items-center mb-sm">
-                    <h3>{p.nome}</h3>
+                    <div>
+                      <h3>{p.nome}</h3>
+                      {p.criadoPorIA && <span className="badge badge-accent ml-sm" style={{ fontSize: '0.7rem' }}>🤖 Criado por IA</span>}
+                    </div>
                     <div className="flex gap-xs">
                       <button className="btn-icon" onClick={() => openPlanoModal(p)}><Edit2 size={16} /></button>
                       <button className="btn-icon text-red" onClick={() => { setItemToDelete({ id: p.id, type: 'plano' }); setIsConfirmOpen(true); }}><Trash2 size={16} /></button>
                     </div>
                   </div>
+                  {p.objetivo && <p className="text-muted mb-sm" style={{ fontSize: '0.82rem' }}>🎯 {p.objetivo} {p.nivel ? `• ${p.nivel}` : ''}</p>}
                   <p className="text-muted">{p.exercicios?.length || 0} exercícios</p>
                   {p.exercicios?.map((ex, i) => (
                     <div key={i} className="flex items-center gap-sm mt-xs" style={{ fontSize: '0.85rem', borderBottom: '1px solid var(--border)', paddingBottom: 6 }}>
@@ -462,7 +532,7 @@ export default function Academia() {
                 <XAxis dataKey="label" tick={{ fill: '#7a7a9a', fontSize: 11 }} axisLine={false} tickLine={false} />
                 <YAxis allowDecimals={false} tick={{ fill: '#7a7a9a', fontSize: 11 }} axisLine={false} tickLine={false} />
                 <Tooltip contentStyle={{ background: '#1e1e30', border: '1px solid #7c6aff', borderRadius: 8, color: '#fff' }} />
-                <Bar dataKey="treinos" name="Treinos" fill="var(--accent)" radius={[4, 4, 0, 0]} barSize={20} />
+                <Bar dataKey="treinos" name="Treinos" fill="#a2ff00" radius={[4, 4, 0, 0]} barSize={20} />
               </BarChart>
             </ResponsiveContainer>
           </div>

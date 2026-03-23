@@ -3,8 +3,9 @@ import { useApp } from '../context/AppContext';
 import { useAuth } from '../context/AuthContext';
 import { db } from '../firebase';
 import { doc, setDoc, addDoc, collection, updateDoc, serverTimestamp } from 'firebase/firestore';
-import Groq from 'groq-sdk';
-import { Send, Bot, User as UserIcon, Droplets, Plus, Minus, Check, Loader2, Trash2, Apple, UtensilsCrossed } from 'lucide-react';
+import { callClaude, extractPlan } from '../utils/claudeApi';
+import ReactMarkdown from 'react-markdown';
+import { Send, Droplets, Plus, Minus, Loader2, Trash2, UtensilsCrossed, Save } from 'lucide-react';
 
 const TABS = ['🤖 Nutricionista IA', '🍽️ Plano Alimentar', '💧 Hidratação'];
 
@@ -16,6 +17,18 @@ const QUICK_MSGS = [
   'Sugestão para pré-treino',
   'O que comer para emagrecer?',
 ];
+
+const MD_COMPONENTS = {
+  p: ({ children }) => <p style={{ marginBottom: 8 }}>{children}</p>,
+  strong: ({ children }) => <strong style={{ color: '#eeeef5' }}>{children}</strong>,
+  ul: ({ children }) => <ul style={{ paddingLeft: 16, marginBottom: 8 }}>{children}</ul>,
+  ol: ({ children }) => <ol style={{ paddingLeft: 16, marginBottom: 8 }}>{children}</ol>,
+  li: ({ children }) => <li style={{ marginBottom: 4 }}>{children}</li>,
+  h1: ({ children }) => <h3 style={{ color: '#00e676', marginBottom: 8 }}>{children}</h3>,
+  h2: ({ children }) => <h4 style={{ color: '#00e676', marginBottom: 8 }}>{children}</h4>,
+  h3: ({ children }) => <h5 style={{ color: '#00e676', marginBottom: 6 }}>{children}</h5>,
+  code: ({ children }) => <code style={{ background: 'rgba(0,230,118,0.1)', padding: '2px 6px', borderRadius: 4, fontSize: '0.85em' }}>{children}</code>,
+};
 
 function getContextoNutricao(user, metricas, plano, refeicoes, hidratacao) {
   const ult = metricas[0] || {};
@@ -37,14 +50,25 @@ PERFIL DO USUÁRIO:
 - Restrições: ${ult.restricoes || 'nenhuma'}
 
 HOJE (${hoje}):
-- Refeições registradas: ${refHoje.length > 0 ? refHoje.map(r => r.desc).join(', ') : 'nenhuma ainda'}  
+- Refeições registradas: ${refHoje.length > 0 ? refHoje.map(r => r.desc).join(', ') : 'nenhuma ainda'}
 - Hidratação: ${hidHoje}ml
 - Plano atual: ${plano ? plano.nome || 'Plano ativo' : 'nenhum plano definido'}
 
 Suas capacidades: criar planos alimentares, calcular calorias/macros, sugerir substituições, analisar refeições, ajustar plano, responder dúvidas sobre nutrição e suplementação.
 Quando criar um plano, estruture: objetivo calórico, macros em g e %, refeição por refeição com horário, lista de recomendados/evitar.
 Sempre pergunte objetivo, restrições, peso, altura e rotina antes de criar um plano.
-Responda SEMPRE em português brasileiro. Seja direta e prática.`;
+Responda SEMPRE em português brasileiro. Seja direta e prática. Use Markdown para formatar.
+
+INSTRUÇÃO ESPECIAL — CRIAÇÃO DE PLANOS ALIMENTARES:
+Quando criar um plano alimentar completo, inclua no FINAL da mensagem um bloco JSON entre as tags <PLANO_NUTRICAO> e </PLANO_NUTRICAO> com esta estrutura:
+<PLANO_NUTRICAO>
+{
+  "nome": "Plano Alimentar - [Objetivo]",
+  "objetivo": "Emagrecimento/Ganho de massa/etc",
+  "caloriasAlvo": 2000,
+  "conteudo": "Texto completo do plano formatado com refeições e horários"
+}
+</PLANO_NUTRICAO>`;
 }
 
 export default function Nutricao() {
@@ -52,7 +76,7 @@ export default function Nutricao() {
   const { user } = useAuth();
   const [tab, setTab] = useState(0);
 
-  const apiKey = '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';
+  const apiKey = state.config?.claudeApiKey || '';
   const metricas = state.academia?.metricas || [];
   const plano = state.nutricao?.plano;
   const refeicoes = state.nutricao?.refeicoes || [];
@@ -66,6 +90,7 @@ export default function Nutricao() {
   });
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
+  const [pendingPlan, setPendingPlan] = useState(null);
   const endRef = useRef(null);
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
@@ -73,21 +98,45 @@ export default function Nutricao() {
 
   const sendMsg = async (text) => {
     if (!text?.trim()) return;
+    if (!apiKey) {
+      setMessages(prev => [...prev, { role: 'user', content: text.trim() }, { role: 'assistant', content: '❌ **API Key não configurada.** Vá em ⚙️ Configurações e adicione sua API Key da Anthropic.' }]);
+      setInput('');
+      return;
+    }
     const newMsgs = [...messages, { role: 'user', content: text.trim() }];
     setMessages(newMsgs);
     setInput('');
     setIsLoading(true);
     try {
-      const groq = new Groq({ apiKey, dangerouslyAllowBrowser: true });
       const systemPrompt = getContextoNutricao(user, metricas, plano, refeicoes, hidratacao);
-      const completion = await groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        messages: [{ role: 'system', content: systemPrompt }, ...newMsgs.slice(-20).map(m => ({ role: m.role, content: m.content }))],
-        temperature: 0.7, max_tokens: 2048,
-      });
-      setMessages(prev => [...prev, { role: 'assistant', content: completion.choices[0]?.message?.content || 'Desculpe, não consegui gerar uma resposta.' }]);
-    } catch (e) { setMessages(prev => [...prev, { role: 'assistant', content: '❌ Erro ao conectar com a IA. Verifique a conexão.' }]); }
+      const chatHistory = newMsgs.slice(-20).map(m => ({ role: m.role, content: m.content }));
+      const responseText = await callClaude(systemPrompt, chatHistory, apiKey);
+
+      // Check for plan in response
+      const { cleanText, planData } = extractPlan(responseText, 'PLANO_NUTRICAO');
+      if (planData) {
+        setPendingPlan(planData);
+      }
+      setMessages(prev => [...prev, { role: 'assistant', content: cleanText }]);
+    } catch (err) {
+      setMessages(prev => [...prev, { role: 'assistant', content: `❌ Erro: ${err.message}` }]);
+    }
     setIsLoading(false);
+  };
+
+  const savePlan = async () => {
+    if (!pendingPlan || !user) return;
+    try {
+      await setDoc(doc(db, `users/${user.uid}/nutricao_plano`, 'atual'), {
+        ...pendingPlan,
+        criadoPorIA: true,
+        criadoEm: serverTimestamp(),
+      });
+      setMessages(prev => [...prev, { role: 'assistant', content: '✅ **Plano alimentar salvo com sucesso!** Acesse a aba "🍽️ Plano Alimentar" para visualizar.' }]);
+      setPendingPlan(null);
+    } catch (e) {
+      setMessages(prev => [...prev, { role: 'assistant', content: '❌ Erro ao salvar plano: ' + e.message }]);
+    }
   };
 
   // === TAB 2: HIDRATAÇÃO ===
@@ -99,9 +148,8 @@ export default function Nutricao() {
 
   const addCopo = async () => {
     if (!user) return;
-    const novoMl = mlHoje + 250;
     if (hidHoje) {
-      await updateDoc(doc(db, `users/${user.uid}/nutricao_hidratacao`, hidHoje.id), { ml: novoMl });
+      await updateDoc(doc(db, `users/${user.uid}/nutricao_hidratacao`, hidHoje.id), { ml: mlHoje + 250 });
     } else {
       await addDoc(collection(db, `users/${user.uid}/nutricao_hidratacao`), { data: hojeStr, ml: 250, criadoEm: serverTimestamp() });
     }
@@ -117,38 +165,52 @@ export default function Nutricao() {
       <style>{`
         .nutri-tabs { display: flex; gap: 4px; background: var(--surface); border-radius: 12px; padding: 4px; margin-bottom: 24px; overflow-x: auto; }
         .nutri-tab { padding: 10px 20px; border-radius: 8px; font-size: 0.85rem; font-weight: 600; cursor: pointer; background: transparent; border: none; color: var(--text-secondary); transition: all 0.2s; white-space: nowrap; }
-        .nutri-tab.active { background: var(--accent); color: #fff; }
+        .nutri-tab.active { background: var(--green); color: #000; }
         .nutri-tab:hover:not(.active) { background: var(--surface2); }
 
         .chat-area { display: flex; flex-direction: column; height: calc(100vh - 220px); background: var(--surface); border: 1px solid var(--border); border-radius: 16px; overflow: hidden; }
         .chat-msgs { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
         .chat-msgs::-webkit-scrollbar { width: 4px; } .chat-msgs::-webkit-scrollbar-thumb { background: #252538; border-radius: 4px; }
-        .chat-bubble { max-width: 80%; padding: 14px 18px; border-radius: 16px; font-size: 0.9rem; line-height: 1.5; white-space: pre-wrap; }
+        .chat-bubble { max-width: 80%; padding: 14px 18px; border-radius: 16px; font-size: 0.9rem; line-height: 1.6; }
         .chat-bubble.user { align-self: flex-end; background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff; border-bottom-right-radius: 4px; }
         .chat-bubble.assistant { align-self: flex-start; background: var(--surface2); border-bottom-left-radius: 4px; }
         .chat-input-bar { display: flex; gap: 8px; padding: 16px; border-top: 1px solid var(--border); background: var(--surface); }
         .chat-input-bar input { flex: 1; background: var(--surface2); border: 1px solid var(--border); border-radius: 12px; padding: 12px 16px; color: var(--text); font-size: 0.9rem; outline: none; }
-        .chat-input-bar input:focus { border-color: var(--accent); }
-        .chat-send { width: 44px; height: 44px; border-radius: 12px; background: linear-gradient(135deg, var(--accent), var(--accent2)); border: none; color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+        .chat-input-bar input:focus { border-color: var(--green); }
+        .chat-send { width: 44px; height: 44px; border-radius: 12px; background: linear-gradient(135deg, var(--green), #00c853); border: none; color: #000; cursor: pointer; display: flex; align-items: center; justify-content: center; }
 
         .quick-chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
         .quick-chip { padding: 8px 14px; border-radius: 20px; font-size: 0.78rem; background: var(--surface2); border: 1px solid var(--border); color: var(--text-secondary); cursor: pointer; transition: all 0.2s; }
-        .quick-chip:hover { border-color: var(--accent); color: var(--text); background: rgba(124,106,255,0.08); }
+        .quick-chip:hover { border-color: var(--green); color: var(--text); background: rgba(0,230,118,0.08); }
+
+        .save-plan-card { background: rgba(0,230,118,0.08); border: 1px solid var(--green); border-radius: 12px; padding: 16px; margin: 12px 0; display: flex; align-items: center; gap: 12px; align-self: flex-start; max-width: 80%; }
+        .save-plan-btn { padding: 8px 20px; border-radius: 8px; background: var(--green); color: #000; border: none; cursor: pointer; font-weight: 700; font-size: 0.85rem; display: flex; align-items: center; gap: 6px; }
+        .save-plan-btn:hover { opacity: 0.9; }
 
         .water-card { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 32px; text-align: center; max-width: 500px; margin: 0 auto; }
-        .water-circle { width: 180px; height: 180px; border-radius: 50%; margin: 24px auto; position: relative; display: flex; align-items: center; justify-content: center; flex-direction: column; }
+        .water-circle { width: 180px; height: 180px; border-radius: 50%; margin: 24px auto; position: relative; display: flex; align-items: center; justify-content: center; }
         .water-btn { width: 64px; height: 64px; border-radius: 50%; border: none; font-size: 1.5rem; cursor: pointer; transition: all 0.2s; display: flex; align-items: center; justify-content: center; }
         .water-btn:hover { transform: scale(1.1); }
+
+        .no-key-banner { padding: 16px; background: rgba(255,106,155,0.1); border: 1px solid var(--accent2); border-radius: 12px; margin-bottom: 16px; font-size: 0.85rem; }
 
         @media (max-width: 768px) {
           .chat-area { height: calc(100vh - 280px); }
           .chat-bubble { max-width: 92%; }
+          .save-plan-card { max-width: 92%; }
         }
       `}</style>
 
       <div className="page-header mb-md">
         <h1>🥗 Nutrição</h1>
+        <p className="text-muted">Powered by Claude — Nara, sua nutricionista virtual</p>
       </div>
+
+      {!apiKey && (
+        <div className="no-key-banner">
+          ⚠️ <strong>API Key não configurada.</strong> Vá em ⚙️ Configurações e adicione sua API Key da Anthropic (Claude).
+        </div>
+      )}
 
       <div className="nutri-tabs">
         {TABS.map((t, i) => (
@@ -156,7 +218,7 @@ export default function Nutricao() {
         ))}
       </div>
 
-      {/* TAB 0: Chat IA Nutricionista */}
+      {/* TAB 0: Chat IA */}
       {tab === 0 && (
         <>
           <div className="quick-chips">
@@ -168,9 +230,17 @@ export default function Nutricao() {
             <div className="chat-msgs">
               {messages.map((m, i) => (
                 <div key={i} className={`chat-bubble ${m.role}`}>
-                  {m.content}
+                  {m.role === 'assistant' ? (
+                    <ReactMarkdown components={MD_COMPONENTS}>{m.content}</ReactMarkdown>
+                  ) : m.content}
                 </div>
               ))}
+              {pendingPlan && (
+                <div className="save-plan-card">
+                  <span>🥗 Nara criou um plano alimentar para você!</span>
+                  <button className="save-plan-btn" onClick={savePlan}><Save size={16} /> Salvar Plano</button>
+                </div>
+              )}
               {isLoading && <div className="chat-bubble assistant flex items-center gap-sm"><Loader2 size={16} className="spin" /> Nara está pensando...</div>}
               <div ref={endRef} />
             </div>
@@ -179,7 +249,7 @@ export default function Nutricao() {
               <button type="submit" className="chat-send" disabled={isLoading || !input.trim()}><Send size={18} /></button>
             </form>
           </div>
-          <button className="btn btn-ghost mt-sm" style={{ fontSize: '0.8rem' }} onClick={() => setMessages([{ role: 'assistant', content: 'Chat reiniciado. Em que posso ajudar?' }])}>
+          <button className="btn btn-ghost mt-sm" style={{ fontSize: '0.8rem' }} onClick={() => { setMessages([{ role: 'assistant', content: 'Chat reiniciado. Em que posso ajudar?' }]); setPendingPlan(null); }}>
             <Trash2 size={14} /> Limpar chat
           </button>
         </>
@@ -191,8 +261,9 @@ export default function Nutricao() {
           {plano ? (
             <div className="card">
               <h2 className="mb-md">{plano.nome || 'Meu Plano Alimentar'}</h2>
-              <div style={{ whiteSpace: 'pre-wrap', lineHeight: 1.7, fontSize: '0.9rem' }}>
-                {plano.conteudo || 'Peça à Nara para criar seu plano alimentar na aba Nutricionista IA!'}
+              {plano.caloriasAlvo && <p className="text-muted mb-md">🎯 Meta: {plano.caloriasAlvo} kcal/dia | Objetivo: {plano.objetivo || '-'}</p>}
+              <div style={{ lineHeight: 1.7, fontSize: '0.9rem' }}>
+                <ReactMarkdown components={MD_COMPONENTS}>{plano.conteudo || 'Peça à Nara para criar seu plano alimentar!'}</ReactMarkdown>
               </div>
               <button className="btn btn-ghost mt-lg" onClick={() => { setTab(0); sendMsg('Ajustar meu plano alimentar atual'); }}>
                 Pedir ajuste à Nara →
@@ -203,7 +274,7 @@ export default function Nutricao() {
               <UtensilsCrossed size={48} className="text-muted" style={{ marginBottom: 16 }} />
               <h3>Nenhum plano alimentar definido</h3>
               <p className="text-muted mt-sm">Peça à Nara para criar um plano personalizado para você!</p>
-              <button className="btn btn-primary mt-lg" onClick={() => { setTab(0); sendMsg('Criar meu plano alimentar'); }}>
+              <button className="btn btn-primary mt-lg" style={{ background: 'var(--green)', color: '#000' }} onClick={() => { setTab(0); sendMsg('Criar meu plano alimentar'); }}>
                 🤖 Falar com Nara
               </button>
             </div>
@@ -236,7 +307,7 @@ export default function Nutricao() {
             <button className="water-btn" style={{ background: 'var(--surface2)', color: 'var(--red)' }} onClick={removeCopo}>
               <Minus size={28} />
             </button>
-            <button className="water-btn" style={{ background: 'linear-gradient(135deg, var(--accent3), var(--accent))', color: '#fff', width: 80, height: 80, fontSize: '1.2rem', boxShadow: '0 4px 20px rgba(0,212,255,0.3)' }} onClick={addCopo}>
+            <button className="water-btn" style={{ background: 'linear-gradient(135deg, var(--accent3), var(--accent))', color: '#fff', width: 80, height: 80, boxShadow: '0 4px 20px rgba(0,212,255,0.3)' }} onClick={addCopo}>
               <Plus size={32} />
             </button>
             <button className="water-btn" style={{ background: 'var(--surface2)', color: 'var(--text-secondary)' }} disabled>
@@ -244,7 +315,6 @@ export default function Nutricao() {
             </button>
           </div>
 
-          {/* Últimos 7 dias */}
           <div className="mt-xl">
             <h3 className="text-muted mb-md" style={{ fontSize: '0.85rem' }}>Últimos 7 dias</h3>
             <div className="flex justify-center gap-sm">

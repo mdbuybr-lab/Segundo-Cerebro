@@ -122,7 +122,13 @@ export default function Dashboard() {
   const anotacoes = state.anotacoes || [];
 
   // === CARD 1: Patrimônio ===
-  const patrimonioTotal = contas.reduce((sum, c) => sum + (Number(c.saldo) || 0), 0);
+  // Replicate ContasBancarias.getSaldoAtual: saldoInicial + sum(entradas contaDestino) - sum(saidas contaOrigem)
+  const patrimonioTotal = contas.reduce((sum, c) => {
+    const saldoIni = parseFloat(c.saldoInicial || c.saldo || 0);
+    const totalEnt = entradas.filter(e => e.contaDestino === c.id).reduce((s, e) => s + (parseFloat(e.valor) || 0), 0);
+    const totalSai = saidas.filter(s => s.contaOrigem === c.id).reduce((s, e) => s + (parseFloat(e.valor) || 0), 0);
+    return sum + saldoIni + totalEnt - totalSai;
+  }, 0);
 
   const entradasMes = entradas.filter(e => e.data?.startsWith(mesAtual)).reduce((s, e) => s + (parseFloat(e.valor) || 0), 0);
   const saidasMes = saidas.filter(s => s.data?.startsWith(mesAtual)).reduce((s, e) => s + (parseFloat(e.valor) || 0), 0);
@@ -189,7 +195,7 @@ export default function Dashboard() {
   const gastosPorCategoria = useMemo(() => {
     const agrupado = {};
     saidas.filter(s => s.data?.startsWith(mesAtual)).forEach(s => {
-      const cat = s.cat || 'Outros';
+      const cat = s.categoria || s.cat || 'Outros';
       agrupado[cat] = (agrupado[cat] || 0) + (Number(s.valor) || 0);
     });
     return Object.entries(agrupado).map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value);
@@ -201,7 +207,7 @@ export default function Dashboard() {
     return saidas.filter(s => s.data?.startsWith(mesAtual))
       .sort((a, b) => Number(b.valor) - Number(a.valor))
       .slice(0, 5)
-      .map(s => ({ name: (s.desc || 'Sem descrição').slice(0, 22), value: Number(s.valor) || 0 }));
+      .map(s => ({ name: (s.descricao || s.desc || 'Sem descrição').slice(0, 22), value: Number(s.valor) || 0 }));
   }, [saidas, mesAtual]);
 
   const comparativo6m = useMemo(() => {
@@ -217,6 +223,7 @@ export default function Dashboard() {
   }, [entradas, saidas]);
 
   const maiorGastoMes = saidas.filter(s => s.data?.startsWith(mesAtual)).sort((a, b) => Number(b.valor) - Number(a.valor))[0];
+  const maiorGastoDesc = maiorGastoMes ? (maiorGastoMes.descricao || maiorGastoMes.desc || '') : '';
   const catTop = gastosPorCategoria[0];
   const melhorMes = comparativo6m.reduce((best, m) => (m.entradas - m.saidas) > (best.entradas - best.saidas) ? m : best, comparativo6m[0] || { label: '-', entradas: 0, saidas: 0 });
   const diasNoMes = new Date().getDate();
@@ -580,7 +587,7 @@ export default function Dashboard() {
                 <div className="flex items-center gap-sm">
                   <span style={{ fontSize: '1.3rem' }}>💰</span>
                   <span className="text-muted">Maior gasto:</span>
-                  <span className="font-mono" style={{ flex: 1, textAlign: 'right' }}>{maiorGastoMes ? `${(maiorGastoMes.desc || '').slice(0, 20)} — ${formatCurrency(Number(maiorGastoMes.valor))}` : 'Nenhum'}</span>
+                  <span className="font-mono" style={{ flex: 1, textAlign: 'right' }}>{maiorGastoMes ? `${maiorGastoDesc.slice(0, 20)} — ${formatCurrency(Number(maiorGastoMes.valor))}` : 'Nenhum'}</span>
                 </div>
                 <div className="flex items-center gap-sm">
                   <span style={{ fontSize: '1.3rem' }}>📦</span>
